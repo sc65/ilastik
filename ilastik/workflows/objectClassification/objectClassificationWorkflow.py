@@ -18,6 +18,7 @@
 # on the ilastik web site at:
 #		   http://ilastik.org/license.html
 ###############################################################################
+from __future__ import division
 import sys
 import os
 import warnings
@@ -28,7 +29,6 @@ import numpy
 import h5py
 
 from ilastik.workflow import Workflow
-from ilastik.applets.projectMetadata import ProjectMetadataApplet
 from ilastik.applets.dataSelection import DataSelectionApplet, DatasetInfo
 from ilastik.applets.featureSelection import FeatureSelectionApplet
 from ilastik.applets.pixelClassification import PixelClassificationApplet
@@ -48,6 +48,7 @@ from lazyflow.operators.generic import OpTransposeSlots, OpSelectSubslot
 from lazyflow.operators.valueProviders import OpAttributeSelector
 from lazyflow.roi import TinyVector
 from lazyflow.utility import PathComponents
+from ilastik.applets.objectExtraction.opObjectExtraction import default_features_key
 
 import logging
 logger = logging.getLogger(__name__)
@@ -68,7 +69,7 @@ OUTPUT_COLUMNS = ["x_px", "y_px", "z_px",
 
 class ObjectClassificationWorkflow(Workflow):
     workflowName = "Object Classification Workflow Base"
-    defaultAppletIndex = 1 # show DataSelection by default
+    defaultAppletIndex = 0 # show DataSelection by default
 
     def __init__(self, shell, headless,
                  workflow_cmdline_args,
@@ -104,8 +105,6 @@ class ObjectClassificationWorkflow(Workflow):
         self._applets = []
 
         self.pcApplet = None
-        self.projectMetadataApplet = ProjectMetadataApplet()
-        self._applets.append(self.projectMetadataApplet)
 
         self.setupInputs()
         
@@ -163,14 +162,22 @@ class ObjectClassificationWorkflow(Workflow):
                 export_arg_parser.add_argument( "--table_filename", help="The location to export the object feature/prediction CSV file.", required=False )
                 export_arg_parser.add_argument( "--export_object_prediction_img", action="store_true" )
                 export_arg_parser.add_argument( "--export_object_probability_img", action="store_true" )
+                export_arg_parser.add_argument( "--export_pixel_probability_img", action="store_true" )
                 
                 # TODO: Support this, too, someday?
                 #export_arg_parser.add_argument( "--export_object_label_img", action="store_true" )
                 
-                if self.input_types == 'raw':
-                    export_arg_parser.add_argument( "--export_pixel_probability_img", action="store_true" )
+                    
                 self._export_args, unused_args = export_arg_parser.parse_known_args(unused_args)
-                self._export_args.export_pixel_probability_img = self._export_args.export_pixel_probability_img or None
+                if self.input_types != 'raw' and self._export_args.export_pixel_probability_img:
+                    raise RuntimeError("Invalid command-line argument: \n"\
+                                       "--export_pixel_probability_img' can only be used with the combined "\
+                                       "'Pixel Classification + Object Classification' workflow.")
+
+                if sum([self._export_args.export_object_prediction_img,
+                        self._export_args.export_object_probability_img,
+                        self._export_args.export_pixel_probability_img]) > 1:
+                    raise RuntimeError("Invalid command-line arguments: Only one type classification output can be exported at a time.")
 
                 # We parse the export setting args first.  All remaining args are considered input files by the input applet.
                 self._batch_export_args, unused_args = self.dataExportApplet.parse_known_cmdline_args( unused_args )
@@ -211,34 +218,34 @@ class ObjectClassificationWorkflow(Workflow):
             opPixelClassification = self.pcApplet.topLevelOperator
             if opPixelClassification.classifier_cache.Output.ready() and \
                not opPixelClassification.classifier_cache._dirty:
-                self.stored_pixel_classifer = opPixelClassification.classifier_cache.Output.value
+                self.stored_pixel_classifier = opPixelClassification.classifier_cache.Output.value
             else:
-                self.stored_pixel_classifer = None
+                self.stored_pixel_classifier = None
         
         opObjectClassification = self.objectClassificationApplet.topLevelOperator
         if opObjectClassification.classifier_cache.Output.ready() and \
            not opObjectClassification.classifier_cache._dirty:
-            self.stored_object_classifer = opObjectClassification.classifier_cache.Output.value
+            self.stored_object_classifier = opObjectClassification.classifier_cache.Output.value
         else:
-            self.stored_object_classifer = None
+            self.stored_object_classifier = None
 
     def handleNewLanesAdded(self):
         """
         If new lanes were added, then we invalidated our classifiers unecessarily.
-        Here, we can restore the classifer so it doesn't need to be retrained.
+        Here, we can restore the classifier so it doesn't need to be retrained.
         """
         # If we have stored classifiers, restore them into the workflow now.
-        if self.stored_pixel_classifer:
+        if self.stored_pixel_classifier:
             opPixelClassification = self.pcApplet.topLevelOperator
-            opPixelClassification.classifier_cache.forceValue(self.stored_pixel_classifer)
+            opPixelClassification.classifier_cache.forceValue(self.stored_pixel_classifier)
             # Release reference
-            self.stored_pixel_classifer = None
+            self.stored_pixel_classifier = None
 
-        if self.stored_object_classifer:
+        if self.stored_object_classifier:
             opObjectClassification = self.objectClassificationApplet.topLevelOperator
-            opObjectClassification.classifier_cache.forceValue(self.stored_object_classifer)
+            opObjectClassification.classifier_cache.forceValue(self.stored_object_classifier)
             # Release reference
-            self.stored_object_classifer = None
+            self.stored_object_classifier = None
 
     def connectLane(self, laneIndex):
         rawslot, binaryslot = self.connectInputs(laneIndex)
@@ -254,7 +261,6 @@ class ObjectClassificationWorkflow(Workflow):
         opObjExtraction.BinaryImage.connect(binaryslot)
 
         opObjClassification.RawImages.connect(rawslot)
-        opObjClassification.LabelsAllowedFlags.connect(opData.AllowLabels)
         opObjClassification.BinaryImages.connect(binaryslot)
 
         opObjClassification.SegmentationImages.connect(opObjExtraction.LabelImage)
@@ -292,7 +298,7 @@ class ObjectClassificationWorkflow(Workflow):
             return
         
         if not (self._batch_input_args and self._batch_export_args):
-            raise RuntimeError("Currently, this workflow has no batch mode and headless mode support")
+            logger.warn("Was not able to understand the batch mode command-line arguments.")
         
         # Check for problems: Is the project file ready to use?
         opObjClassification = self.objectClassificationApplet.topLevelOperator
@@ -437,15 +443,19 @@ class ObjectClassificationWorkflow(Workflow):
         When the batch-processing mechanism was rewritten, this function broke.
         It could probably be fixed with minor changes.
         """
+        assert sys.version_info.major == 2, "Alert! This function has not been " \
+        "tested under python 3. Please remove this assertion, and be wary of any " \
+        "strange behavior you encounter"
+
         # TODO: Here, we hard-code to select from the first lane only.
         opBatchClassify = self.opBatchClassify[0]
         
-        from lazyflow.utility.io.blockwiseFileset import vectorized_pickle_dumps
+        from lazyflow.utility.io_uti.blockwiseFileset import vectorized_pickle_dumps
         # Assume that roi always starts as a multiple of the blockshape
         block_shape = opBatchClassify.get_blockshape()
         assert all(block_shape == blockwise_fileset.description.sub_block_shape), "block shapes don't match"
         assert all((roi[0] % block_shape) == 0), "Sub-blocks must exactly correspond to the blockwise object classification blockshape"
-        sub_block_index = roi[0] / blockwise_fileset.description.sub_block_shape
+        sub_block_index = roi[0] // blockwise_fileset.description.sub_block_shape
 
         sub_block_start = sub_block_index
         sub_block_stop = sub_block_start + 1
@@ -454,7 +464,7 @@ class ObjectClassificationWorkflow(Workflow):
         # FIRST, remove all objects that lie outside the block (i.e. remove the ones in the halo)
         region_features = opBatchClassify.BlockwiseRegionFeatures( *sub_block_roi ).wait()
         region_features_dict = region_features.flat[0]
-        region_centers = region_features_dict['Default features']['RegionCenter']
+        region_centers = region_features_dict[default_features_key]['RegionCenter']
 
         opBlockPipeline = opBatchClassify._blockPipelines[ tuple(roi[0]) ]
 
@@ -498,9 +508,9 @@ class ObjectClassificationWorkflow(Workflow):
         total_offset_5d = halo_roi[0] + image_offset
         total_offset_3d = total_offset_5d[1:-1]
 
-        filtered_features["Default features"]["RegionCenter"] += total_offset_3d
-        filtered_features["Default features"]["Coord<Minimum>"] += total_offset_3d
-        filtered_features["Default features"]["Coord<Maximum>"] += total_offset_3d
+        filtered_features[default_features_key]["RegionCenter"] += total_offset_3d
+        filtered_features[default_features_key]["Coord<Minimum>"] += total_offset_3d
+        filtered_features[default_features_key]["Coord<Maximum>"] += total_offset_3d
 
         # Finally, write the features to hdf5
         h5File = blockwise_fileset.getOpenHdf5FileForBlock( roi[0] )
@@ -513,10 +523,10 @@ class ObjectClassificationWorkflow(Workflow):
         pickled_features = vectorized_pickle_dumps(numpy.array((filtered_features,)))
         dataset[0] = pickled_features
 
-        object_centers_xyz = filtered_features["Default features"]["RegionCenter"].astype(int)
-        object_min_coords_xyz = filtered_features["Default features"]["Coord<Minimum>"].astype(int)
-        object_max_coords_xyz = filtered_features["Default features"]["Coord<Maximum>"].astype(int)
-        object_sizes = filtered_features["Default features"]["Count"][:,0].astype(int)
+        object_centers_xyz = filtered_features[default_features_key]["RegionCenter"].astype(int)
+        object_min_coords_xyz = filtered_features[default_features_key]["Coord<Minimum>"].astype(int)
+        object_max_coords_xyz = filtered_features[default_features_key]["Coord<Maximum>"].astype(int)
+        object_sizes = filtered_features[default_features_key]["Count"][:,0].astype(int)
 
         # Also, write out selected features as a 'point cloud' csv file.
         # (Store the csv file next to this block's h5 file.)
@@ -574,6 +584,9 @@ class ObjectClassificationWorkflowPixel(ObjectClassificationWorkflow):
         self._applets.append(self.pcApplet)
         self._applets.append(self.thresholdingApplet)
 
+        if not self._headless:
+            self._shell.currentAppletChanged.connect( self.handle_applet_changed )
+
 
     def connectInputs(self, laneIndex):
                
@@ -600,12 +613,11 @@ class ObjectClassificationWorkflowPixel(ObjectClassificationWorkflow):
         opTrainingFeatures.InputImage.connect(rawslot)
 
         opClassify.InputImages.connect(rawslot)
-        opClassify.LabelsAllowedFlags.connect(opData.AllowLabels)
         opClassify.FeatureImages.connect(opTrainingFeatures.OutputImage)
         opClassify.CachedFeatureImages.connect(opTrainingFeatures.CachedOutputImage)
 
         op5raw.Input.connect(rawslot)
-        op5pred.Input.connect(opClassify.PredictionProbabilities)
+        op5pred.Input.connect(opClassify.CachedPredictionProbabilities)
 
         opThreshold.RawInput.connect(op5raw.Output)
         opThreshold.InputImage.connect(op5pred.Output)
@@ -633,7 +645,7 @@ class ObjectClassificationWorkflowPixel(ObjectClassificationWorkflow):
         cumulated_readyness = cumulated_readyness and features_ready
         self._shell.setAppletEnabled(self.pcApplet, cumulated_readyness)
 
-        slot = self.pcApplet.topLevelOperator.PredictionProbabilities
+        slot = self.pcApplet.topLevelOperator.CachedPredictionProbabilities
         predictions_ready = len(slot) > 0 and \
             slot[0].ready() and \
             (TinyVector(slot[0].meta.shape) > 0).all()
@@ -651,6 +663,13 @@ class ObjectClassificationWorkflowPixel(ObjectClassificationWorkflow):
 
         super(ObjectClassificationWorkflowPixel, self).handleAppletStateUpdateRequested(upstream_ready=cumulated_readyness)
 
+    def handle_applet_changed(self, prev_index, current_index):
+        if prev_index != current_index:
+            # If the user is viewing an applet downstream of the pixel classification applet,
+            # Make sure it's in 'live update' mode, since the rest of the workflow pulls from the *cached* predictions.
+            opPixelClassification = self.pcApplet.topLevelOperator
+            opPixelClassification.FreezePredictions.setValue( self._shell.currentAppletIndex <= self.applets.index( self.pcApplet ) )
+                        
 
 class ObjectClassificationWorkflowBinary(ObjectClassificationWorkflow):
     workflowName = "Object Classification (from binary image)"
@@ -664,7 +683,7 @@ class ObjectClassificationWorkflowBinary(ObjectClassificationWorkflow):
                                                         "Input Data",
                                                         "Input Data",
                                                         batchDataGui=False,
-                                                        forceAxisOrder='txyzc',
+                                                        forceAxisOrder=['txyzc'],
                                                         instructionText=data_instructions )
 
         opData = self.dataSelectionApplet.topLevelOperator
@@ -704,7 +723,7 @@ class ObjectClassificationWorkflowPrediction(ObjectClassificationWorkflow):
                                                         "Input Data",
                                                         "Input Data",
                                                         batchDataGui=False,
-                                                        forceAxisOrder='txyzc',
+                                                        forceAxisOrder=['txyzc'],
                                                         instructionText=data_instructions )
 
         opData = self.dataSelectionApplet.topLevelOperator

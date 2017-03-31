@@ -92,7 +92,7 @@ class OpDivisionFeatures(Operator):
             result[t][config.features_division_name] = res 
         
         stop = time.time()
-        logger.info("TIMING: computing division features took {:.3f}s".format(stop-start))
+        logger.debug("TIMING: computing division features took {:.3f}s".format(stop-start))
         return result
     
     
@@ -134,7 +134,9 @@ class OpTrackingFeatureExtraction(Operator):
     FeatureNamesVigra = InputSlot(rtype=List, stype=Opaque, value={})
     
     FeatureNamesDivision = InputSlot(rtype=List, stype=Opaque, value={})
-        
+ 
+    # Bypass cache (for headless mode)
+    BypassModeEnabled = InputSlot(value=False)        
 
     LabelImage = OutputSlot()
     ObjectCenterImage = OutputSlot()
@@ -146,18 +148,16 @@ class OpTrackingFeatureExtraction(Operator):
     RegionFeaturesDivision = OutputSlot(stype=Opaque, rtype=List)
     RegionFeaturesAll = OutputSlot(stype=Opaque, rtype=List)
     
-    
-    ComputedFeatureNamesVigra = OutputSlot(rtype=List, stype=Opaque)
     ComputedFeatureNamesAll = OutputSlot(rtype=List, stype=Opaque)
+    ComputedFeatureNamesNoDivisions = OutputSlot(rtype=List, stype=Opaque)
 
     BlockwiseRegionFeaturesVigra = OutputSlot() # For compatibility with tracking workflow, the RegionFeatures output
                                                 # has rtype=List, indexed by t.
                                                 # For other workflows, output has rtype=ArrayLike, indexed by (t)
     BlockwiseRegionFeaturesDivision = OutputSlot() 
     
-    LabelInputHdf5 = InputSlot(optional=True)
-    LabelOutputHdf5 = OutputSlot()
     CleanLabelBlocks = OutputSlot()
+    LabelImageCacheInput = InputSlot(optional=True)
 
     RegionFeaturesCacheInputVigra = InputSlot(optional=True)
     RegionFeaturesCleanBlocksVigra = OutputSlot()
@@ -178,17 +178,15 @@ class OpTrackingFeatureExtraction(Operator):
         # connect internal operators
         self._objectExtraction.RawImage.connect(self.RawImage)
         self._objectExtraction.BinaryImage.connect(self.BinaryImage)
-        
+        self._objectExtraction.BypassModeEnabled.connect(self.BypassModeEnabled)
         self._objectExtraction.Features.connect(self.FeatureNamesVigra)
-        self._objectExtraction.LabelInputHdf5.connect(self.LabelInputHdf5)
         self._objectExtraction.RegionFeaturesCacheInput.connect(self.RegionFeaturesCacheInputVigra)
-        self.LabelOutputHdf5.connect(self._objectExtraction.LabelOutputHdf5)
+        self._objectExtraction.LabelImageCacheInput.connect(self.LabelImageCacheInput)
         self.CleanLabelBlocks.connect(self._objectExtraction.CleanLabelBlocks)
         self.RegionFeaturesCleanBlocksVigra.connect(self._objectExtraction.RegionFeaturesCleanBlocks)
         self.ObjectCenterImage.connect(self._objectExtraction.ObjectCenterImage)
         self.LabelImage.connect(self._objectExtraction.LabelImage)
         self.BlockwiseRegionFeaturesVigra.connect(self._objectExtraction.BlockwiseRegionFeatures)     
-        self.ComputedFeatureNamesVigra.connect(self._objectExtraction.Features)
         self.RegionFeaturesVigra.connect(self._objectExtraction.RegionFeatures)    
                 
         self._opDivFeats.LabelImage.connect(self.LabelImage)
@@ -204,25 +202,31 @@ class OpTrackingFeatureExtraction(Operator):
         # As soon as input data is available, check its constraints
         self.RawImage.notifyReady( self._checkConstraints )
         self.BinaryImage.notifyReady( self._checkConstraints )
+
+        # FIXME this shouldn't be done in post-filtering, but in reading the config or around that time
+        self.RawImage.notifyReady( self._filterFeaturesByDim )
     
                
     def setupOutputs(self, *args, **kwargs):
         self.ComputedFeatureNamesAll.meta.assignFrom(self.FeatureNamesVigra.meta)
+        self.ComputedFeatureNamesNoDivisions.meta.assignFrom(self.FeatureNamesVigra.meta)
         self.RegionFeaturesAll.meta.assignFrom(self.RegionFeaturesVigra.meta)
-        
+
     def execute(self, slot, subindex, roi, result):
         if slot == self.ComputedFeatureNamesAll:
-            feat_names_vigra = self.ComputedFeatureNamesVigra([]).wait()
+            feat_names_vigra = self.FeatureNamesVigra([]).wait()
             feat_names_div = self.FeatureNamesDivision([]).wait()        
             for plugin_name in feat_names_vigra.keys():
                 assert plugin_name not in feat_names_div, "feature name dictionaries must be mutually exclusive"
             for plugin_name in feat_names_div.keys():
                 assert plugin_name not in feat_names_vigra, "feature name dictionaries must be mutually exclusive"
             result = dict(feat_names_vigra.items() + feat_names_div.items())
-            # FIXME do not hard-code this
-            for name in [ 'SquaredDistances_' + str(i) for i in range(config.n_best_successors) ]:
-                result[config.features_division_name][name] = {}
-            
+
+            return result
+        elif slot == self.ComputedFeatureNamesNoDivisions:
+            feat_names_vigra = self.FeatureNamesVigra([]).wait()
+            result = dict(feat_names_vigra.items())
+
             return result
         elif slot == self.RegionFeaturesAll:
             feat_vigra = self.RegionFeaturesVigra(roi).wait()
@@ -240,12 +244,16 @@ class OpTrackingFeatureExtraction(Operator):
             assert False, "Shouldn't get here."
 
     def propagateDirty(self, slot, subindex, roi):
-        if slot == self.ComputedFeatureNamesVigra or slot == self.FeatureNamesDivision:
+        if  slot == self.BypassModeEnabled:
+            pass
+        elif slot == self.FeatureNamesVigra or slot == self.FeatureNamesDivision:
             self.ComputedFeatureNamesAll.setDirty(roi)
-    
+            self.ComputedFeatureNamesNoDivisions.setDirty(roi)
+
     def setInSlot(self, slot, subindex, roi, value):
-        assert slot == self.LabelInputHdf5 or slot == self.RegionFeaturesCacheInputVigra or \
-            slot == self.RegionFeaturesCacheInputDivision, "Invalid slot for setInSlot(): {}".format(slot.name)
+        assert slot == self.RegionFeaturesCacheInputVigra or \
+            slot == self.RegionFeaturesCacheInputDivision or \
+            slot == self.LabelImageCacheInput, "Invalid slot for setInSlot(): {}".format(slot.name)
            
     def _checkConstraints(self, *args):
         if self.RawImage.ready():
@@ -271,8 +279,26 @@ class OpTrackingFeatureExtraction(Operator):
                 
                 msg = "Raw data and other data must have equal dimensions (different channels are okay).\n"\
                       "Your datasets have shapes: {} and {}".format( self.RawImage.meta.shape, self.BinaryImage.meta.shape )
-                raise DatasetConstraintError( "Object Extraction", msg ) 
+                raise DatasetConstraintError( "Object Extraction", msg )
 
+    def _filterFeaturesByDim(self, *args):
+        # Remove 2D-only features from 3D datasets
+        # Features look as follows:
+        # dict[plugin_name][feature_name][parameter_name] = parameter_value
+        # for example {"Standard Object Features": {"Mean in neighborhood":{"margin": (5, 5, 2)}}}
+
+        if self.RawImage.ready() and self.FeatureNamesVigra.ready():
+
+            rawTaggedShape = self.RawImage.meta.getTaggedShape()
+            filtered_features_dict = {}
+            if rawTaggedShape['z']>1:
+                # Filter out the 2D-only features, which helpfully have "2D" in their plugin name
+                current_dict = self.FeatureNamesVigra.value
+                for plugin in current_dict.keys():
+                    if not "2D" in plugin:
+                        filtered_features_dict[plugin] = current_dict[plugin]
+
+                self.FeatureNamesVigra.setValue(filtered_features_dict)
 
 class OpCachedDivisionFeatures(Operator):
     """Caches the division features computed by OpDivisionFeatures."""    

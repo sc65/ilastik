@@ -180,7 +180,6 @@ class OpCounting( Operator ):
 
     LabelInputs = InputSlot(optional = True, level=1) # Input for providing label data from an external source
     BoxLabelInputs = InputSlot(optional = True, level=1) # Input for providing label data from an external source
-    LabelsAllowedFlags = InputSlot(stype='bool', level=1) # Specifies which images are permitted to be labeled 
 
     FeatureImages = InputSlot(level=1) # Computed feature images (each channel is a different feature)
     CachedFeatureImages = InputSlot(level=1) # Cached feature data.
@@ -585,7 +584,7 @@ class OpPredictionPipeline(OpPredictionPipelineNoCache):
         self.meaner = OpMean(parent = self)
         self.meaner.Input.connect(self.prediction_cache_gui.Output)
 
-        self.precomputed_predictions_gui = OpPrecomputedInput( parent=self )
+        self.precomputed_predictions_gui = OpPrecomputedInput( ignore_dirty_input=False, parent=self )
         self.precomputed_predictions_gui.name = "precomputed_predictions_gui"
         self.precomputed_predictions_gui.SlowInput.connect( self.meaner.Output )
         self.precomputed_predictions_gui.PrecomputedInput.connect( self.PredictionsFromDisk )

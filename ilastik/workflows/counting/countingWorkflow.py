@@ -24,7 +24,6 @@ from lazyflow.graph import Graph, Operator, OperatorWrapper
 
 from ilastik.workflow import Workflow
 
-from ilastik.applets.projectMetadata import ProjectMetadataApplet
 from ilastik.applets.dataSelection import DataSelectionApplet
 from ilastik.applets.featureSelection import FeatureSelectionApplet
 from ilastik.applets.featureSelection.opFeatureSelection import OpFeatureSelection
@@ -42,13 +41,13 @@ logger = logging.getLogger(__name__)
 class CountingWorkflow(Workflow):
     workflowName = "Cell Density Counting"
     workflowDescription = "This is obviously self-explanatory."
-    defaultAppletIndex = 1 # show DataSelection by default
+    defaultAppletIndex = 0 # show DataSelection by default
 
     def __init__(self, shell, headless, workflow_cmdline_args, project_creation_args, *args, **kwargs):
         graph = kwargs['graph'] if 'graph' in kwargs else Graph()
         if 'graph' in kwargs: del kwargs['graph']
         super( CountingWorkflow, self ).__init__( shell, headless, workflow_cmdline_args, project_creation_args, graph=graph, *args, **kwargs )
-        self.stored_classifer = None
+        self.stored_classifier = None
 
         # Parse workflow-specific command-line args
         parser = argparse.ArgumentParser()
@@ -58,8 +57,6 @@ class CountingWorkflow(Workflow):
         ######################
         # Interactive workflow
         ######################
-
-        self.projectMetadataApplet = ProjectMetadataApplet()
 
         self.dataSelectionApplet = DataSelectionApplet(self,
                                                        "Input Data",
@@ -90,7 +87,6 @@ class CountingWorkflow(Workflow):
         opDataExport.SelectionNames.setValue( ['Probabilities'] )        
 
         self._applets = []
-        self._applets.append(self.projectMetadataApplet)
         self._applets.append(self.dataSelectionApplet)
         self._applets.append(self.featureSelectionApplet)
         self._applets.append(self.countingApplet)
@@ -132,9 +128,9 @@ class CountingWorkflow(Workflow):
         opCounting = self.countingApplet.topLevelOperator
         if opCounting.classifier_cache.Output.ready() and \
            not opCounting.classifier_cache._dirty:
-            self.stored_classifer = opCounting.classifier_cache.Output.value
+            self.stored_classifier = opCounting.classifier_cache.Output.value
         else:
-            self.stored_classifer = None
+            self.stored_classifier = None
 
     def handleNewLanesAdded(self):
         """
@@ -142,10 +138,10 @@ class CountingWorkflow(Workflow):
         Called immediately after a new lane is added to the workflow and initialized.
         """
         # Restore classifier we saved in prepareForNewLane() (if any)
-        if self.stored_classifer is not None:
-            self.countingApplet.topLevelOperator.classifier_cache.forceValue(self.stored_classifer)
+        if self.stored_classifier is not None:
+            self.countingApplet.topLevelOperator.classifier_cache.forceValue(self.stored_classifier)
             # Release reference
-            self.stored_classifer = None
+            self.stored_classifier = None
 
     def connectLane(self, laneIndex):
         ## Access applet operators
@@ -160,7 +156,6 @@ class CountingWorkflow(Workflow):
 
         opCounting.InputImages.connect(opData.Image)
         opCounting.FeatureImages.connect(opTrainingFeatures.OutputImage)
-        opCounting.LabelsAllowedFlags.connect(opData.AllowLabels)
         opCounting.CachedFeatureImages.connect( opTrainingFeatures.CachedOutputImage )
         #opCounting.UserLabels.connect(opClassify.LabelImages)
         #opCounting.ForegroundLabels.connect(opObjExtraction.LabelImage)

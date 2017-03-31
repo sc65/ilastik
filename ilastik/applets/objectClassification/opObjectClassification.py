@@ -25,7 +25,7 @@ import vigra
 import time
 import warnings
 import itertools
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from functools import partial
 
 from lazyflow.graph import Operator, InputSlot, OutputSlot
@@ -42,6 +42,7 @@ from ilastik.applets.objectExtraction.opObjectExtraction import default_features
 from ilastik.applets.objectExtraction.opObjectExtraction import OpObjectExtraction
 
 from ilastik.applets.base.applet import DatasetConstraintError
+from ilastik.applets.objectExtraction.opObjectExtraction import default_features_key
 
 import logging
 logger = logging.getLogger(__name__)
@@ -82,7 +83,6 @@ class OpObjectClassification(Operator, ExportingOperator, MultiLaneOperatorABC):
     # same format as ComputedFeatureNames
     SelectedFeatures = InputSlot(rtype=List, stype=Opaque)
 
-    LabelsAllowedFlags = InputSlot(stype='bool', level=1)
     AllowDeleteLabels = InputSlot(stype='bool', value=True)
     AllowDeleteLastLabelOnly = InputSlot(stype='bool', value=False)
     AllowAddLabel = InputSlot(stype='bool', value=True)
@@ -124,12 +124,14 @@ class OpObjectClassification(Operator, ExportingOperator, MultiLaneOperatorABC):
     LabelNames = OutputSlot()
     LabelColors = OutputSlot()
     PmapColors = OutputSlot()
+    MaxNumObj = OutputSlot()
 
     # Use a slot for storing the export settings in the project file.
     ExportSettings = OutputSlot()
     # Override functions ExportingOperator mixin
     def configure_table_export_settings(self, settings, selected_features):
         self.ExportSettings.setValue( (settings, selected_features) )
+
     def get_table_export_settings(self):
         if self.ExportSettings.ready() and self.ExportSettings.value:
             (settings, selected_features) = self.ExportSettings.value
@@ -205,8 +207,7 @@ class OpObjectClassification(Operator, ExportingOperator, MultiLaneOperatorABC):
             We need to double-wrap the cache, so we need this operator to provide the first level of wrapping.
             """
             Input = InputSlot(level=1) 
-            innerBlockShape = InputSlot()
-            outerBlockShape = InputSlot()
+            BlockShape = InputSlot()
             fixAtCurrent = InputSlot(value = False)
     
             Output = OutputSlot(level=1)
@@ -216,8 +217,7 @@ class OpObjectClassification(Operator, ExportingOperator, MultiLaneOperatorABC):
                 self._innerOperator = OperatorWrapper( OpSlicedBlockedArrayCache, parent=self )
                 self._innerOperator.Input.connect( self.Input )
                 self._innerOperator.fixAtCurrent.connect( self.fixAtCurrent )
-                self._innerOperator.innerBlockShape.connect( self.innerBlockShape )
-                self._innerOperator.outerBlockShape.connect( self.outerBlockShape )
+                self._innerOperator.BlockShape.connect( self.BlockShape )
                 self.Output.connect( self._innerOperator.Output )
                 
             def execute(self, slot, subindex, roi, destination):
@@ -251,6 +251,8 @@ class OpObjectClassification(Operator, ExportingOperator, MultiLaneOperatorABC):
             self.opPredict.LabelsCount.setValue( numClasses )
             self.opTrain.LabelsCount.setValue( numClasses )
             self.NumLabels.setValue( numClasses )
+            self.MaxNumObj.setValue ( numClasses - 1)
+
         self.LabelNames.notifyDirty( _updateNumClasses )
 
         self.LabelNames.setValue( [] )
@@ -331,6 +333,21 @@ class OpObjectClassification(Operator, ExportingOperator, MultiLaneOperatorABC):
             self._ambiguousLabels.insert(imageIndex, None)
             self._labelBBoxes.insert(imageIndex, dict())
 
+    def clearLabel(self, label):
+        # set this label to 0 in the label inputs
+        for islot, label_slot in enumerate(self.LabelInputs):
+            if not label_slot.ready() or islot>= len(self.RawImages) or \
+                not self.RawImages[islot].ready():
+                continue
+
+            cur_labels = label_slot.value
+            for t in cur_labels.keys():
+                label_values_t = cur_labels[t]
+                label_values_t[label_values_t==label]=0
+                cur_labels[t] = label_values_t
+                label_slot.setValue(cur_labels)
+            label_slot.setDirty([])
+
     def removeLabel(self, label):
         #remove this label from the inputs
         for islot, label_slot in enumerate(self.LabelInputs):
@@ -371,19 +388,13 @@ class OpObjectClassification(Operator, ExportingOperator, MultiLaneOperatorABC):
                        'x' : (256,256),
                        'c' : (100,100) }
 
-        innerBlockShapeX = tuple( blockDimsX[k][0] for k in axisOrder )
-        outerBlockShapeX = tuple( blockDimsX[k][1] for k in axisOrder )
+        blockShapeX = tuple( blockDimsX[k][1] for k in axisOrder )
+        blockShapeY = tuple( blockDimsY[k][1] for k in axisOrder )
+        blockShapeZ = tuple( blockDimsZ[k][1] for k in axisOrder )
 
-        innerBlockShapeY = tuple( blockDimsY[k][0] for k in axisOrder )
-        outerBlockShapeY = tuple( blockDimsY[k][1] for k in axisOrder )
-
-        innerBlockShapeZ = tuple( blockDimsZ[k][0] for k in axisOrder )
-        outerBlockShapeZ = tuple( blockDimsZ[k][1] for k in axisOrder )
-
-        self.opPredictionImageCache.innerBlockShape.setValue( (innerBlockShapeX, innerBlockShapeY, innerBlockShapeZ) )
-        self.opPredictionImageCache.outerBlockShape.setValue( (outerBlockShapeX, outerBlockShapeY, outerBlockShapeZ) )
-        self.opProbChannelsImageCache.innerBlockShape.setValue( (innerBlockShapeX, innerBlockShapeY, innerBlockShapeZ) )
-        self.opProbChannelsImageCache.outerBlockShape.setValue( (outerBlockShapeX, outerBlockShapeY, outerBlockShapeZ) )
+        self.opPredictionImageCache.BlockShape.setValue( (blockShapeX, blockShapeY, blockShapeZ) )
+        self.opProbChannelsImageCache.BlockShape.setValue( (blockShapeX, blockShapeY, blockShapeZ) )
+        self.MaxNumObj.setValue( len(self.LabelNames.value) - 1)
 
     def setInSlot(self, slot, subindex, roi, value):
         pass
@@ -600,8 +611,8 @@ class OpObjectClassification(Operator, ExportingOperator, MultiLaneOperatorABC):
                 object_features_timewise = object_feature_slot([t]).wait()
                 object_features = object_features_timewise[t]
 
-                min_coords = object_features["Default features"]["Coord<Minimum>"]
-                max_coords = object_features["Default features"]["Coord<Maximum>"]
+                min_coords = object_features[default_features_key]["Coord<Minimum>"]
+                max_coords = object_features[default_features_key]["Coord<Maximum>"]
 
                 # Don't bother saving info for objects that aren't labeled
                 min_coords = min_coords[labels.nonzero()]
@@ -653,8 +664,8 @@ class OpObjectClassification(Operator, ExportingOperator, MultiLaneOperatorABC):
                 old_features = old_features_timewise[time]
                 
                 current_bboxes = {}
-                current_bboxes["Coord<Minimum>"] = old_features["Default features"]["Coord<Minimum>"]
-                current_bboxes["Coord<Maximum>"] = old_features["Default features"]["Coord<Maximum>"]
+                current_bboxes["Coord<Minimum>"] = old_features[default_features_key]["Coord<Minimum>"]
+                current_bboxes["Coord<Maximum>"] = old_features[default_features_key]["Coord<Maximum>"]
 
                 json_data_this_time = json_data_this_lane[time_str]
                 saved_labels = numpy.array( json_data_this_time["labels"] )
@@ -747,7 +758,7 @@ class OpObjectClassification(Operator, ExportingOperator, MultiLaneOperatorABC):
 
         label_image = self.SegmentationImages[lane_index]
         obj_count = list(objects_per_frame(label_image))
-        ids = ilastik_ids(obj_count)
+        ids = list(ilastik_ids(obj_count))
 
         file_path = settings["file path"]
         if filename_suffix:
@@ -758,8 +769,36 @@ class OpObjectClassification(Operator, ExportingOperator, MultiLaneOperatorABC):
         export_file.ExportProgress.subscribe(progress_slot)
         export_file.InsertionProgress.subscribe(progress_slot)
 
+        # Object IDs
         export_file.add_columns("table", range(sum(obj_count)), Mode.List, Default.KnimeId)
-        export_file.add_columns("table", list(ids), Mode.List, Default.IlastikId)
+        export_file.add_columns("table", ids, Mode.List, Default.IlastikId)
+
+        # Object Prediction Labels
+        class_names = OrderedDict(enumerate(self.LabelNames.value, start=1))
+        predictions = self.Predictions[lane_index]([]).wait()
+
+        # Predicted classes
+        named_predictions = []
+        for t, object_id in ids:
+             prediction_label = predictions[t][object_id]
+             prediction_name = class_names[prediction_label]
+             named_predictions.append(prediction_name)
+        export_file.add_columns("table", named_predictions, Mode.List, {"names": ("predicted_class",)})
+
+        # Class probabilities
+        probabilities = self.Probabilities[lane_index]([]).wait()
+        probability_columns = OrderedDict((name, []) for name in class_names.values())
+        for t, object_id in ids:
+             for label_id, class_name in class_names.items():
+                 prob = probabilities[t][object_id][label_id-1]
+                 probability_columns[class_name].append( prob )
+
+        probability_column_names = map(lambda class_name: "Probability of {}".format( class_name ), class_names.values())
+        export_file.add_columns("table", zip(*probability_columns.values()), Mode.List, {"names": probability_column_names})
+
+        # Object features
+        computed_names = self.ComputedFeatureNames.value
+
         export_file.add_columns("table", self.ObjectFeatures[lane_index], Mode.IlastikFeatureTable,
                                 {"selection": selected_features})
 
@@ -1089,60 +1128,57 @@ class OpObjectPredict(Operator):
                     n = max(n, len(feature_matrix))
             return n
 
-        # FIXME: self.prob_cache is shared, so we need to block.
-        # However, this makes prediction single-threaded.
+        # Keep a list of times that are not in the cache
         with self.lock:
-            for t in times:
-                if t in self.prob_cache:
-                    continue
+            times_not_cached = [t for t in times if t not in self.prob_cache]
 
-                # Initialize with a single value for the 'background object '
-                prob_predictions[t] = numpy.zeros( (1, len(self.ProbabilityChannels)), dtype=numpy.float32 )
-                tmpfeats = self.Features([t]).wait()
-                num_objects = get_num_objects(tmpfeats[t])
+        # Initialize with a single value for the 'background object ' 
+        if times_not_cached:  
+            tmpfeats = self.Features(times_not_cached).wait()
+                     
+        for t in times_not_cached:
+            prob_predictions[t] = numpy.zeros( (1, len(self.ProbabilityChannels)), dtype=numpy.float32 )
+            num_objects = get_num_objects(tmpfeats[t])#tmpfeats[t])
+            # Apparently self.Features always returns a background object, 
+            #  so we expect at least 1 object in the list, even if there's nothing to predict.
+            assert num_objects > 0
+            if num_objects == 1:
+                continue
+                  
+            ftmatrix, _, col_names = make_feature_array({t:tmpfeats[t]}, selected)
+            rows, cols = replace_missing(ftmatrix)
+            self.bad_objects[t] = numpy.zeros((ftmatrix.shape[0],))
+            self.bad_objects[t][rows] = 1
+            feats[t] = ftmatrix
+  
+        # Are there any objects to predict?
+        if len(feats) > 0:
+            def predict_forest(_t):
+                # Note: We can't use RandomForest.predictLabels() here because we're training in parallel,
+                #        and we have to average the PROBABILITIES from all forests.
+                #       Averaging the label predictions from each forest is NOT equivalent.
+                #       For details please see wikipedia:
+                #       http://en.wikipedia.org/wiki/Electoral_College_%28United_States%29#Irrelevancy_of_national_popular_vote
+                #       (^-^)
+                prob_predictions[_t] = classifier.predict_probabilities(feats[_t].astype(numpy.float32))
+  
+            # predict the data with all the forests in parallel
+            pool = RequestPool()
+            for t in times_not_cached:
+                logger.debug("Predicting object probabilities for time step: {}".format( t ))
+                req = Request( partial(predict_forest, t) )
+                pool.add(req)
+  
+            pool.wait()
+            pool.clean()
 
-                # Apparently self.Features always returns a background object, 
-                #  so we expect at least 1 object in the list, even if there's nothing to predict.
-                assert num_objects > 0
-                if num_objects == 1:
-                    continue
-                    
-                ftmatrix, _, col_names = make_feature_array(tmpfeats, selected)
-                rows, cols = replace_missing(ftmatrix)
-                self.bad_objects[t] = numpy.zeros((ftmatrix.shape[0],))
-                self.bad_objects[t][rows] = 1
-                feats[t] = ftmatrix
-
-            # Are there any objects to predict?
-            if len(feats) > 0:
-                def predict_forest(_t):
-                    # Note: We can't use RandomForest.predictLabels() here because we're training in parallel,
-                    #        and we have to average the PROBABILITIES from all forests.
-                    #       Averaging the label predictions from each forest is NOT equivalent.
-                    #       For details please see wikipedia:
-                    #       http://en.wikipedia.org/wiki/Electoral_College_%28United_States%29#Irrelevancy_of_national_popular_vote
-                    #       (^-^)
-                    prob_predictions[_t] = classifier.predict_probabilities(feats[_t].astype(numpy.float32))
-    
-                # predict the data with all the forests in parallel
-                pool = RequestPool()
-                for t in times:
-                    if t in self.prob_cache:
-                        continue
-                    logger.debug("Predicting object probabilities for time step: {}".format( t ))
-                    req = Request( partial(predict_forest, t) )
-                    pool.add(req)
-    
-                pool.wait()
-                pool.clean()
-
+        with self.lock:
             for t in times:
                 if t not in self.prob_cache:
                     # prob_predictions is a dict-of-arrays, indexed as follows:
                     # prob_predictions[t][object_index, class_index]
                     self.prob_cache[t] = prob_predictions[t]
                     self.prob_cache[t][0] = 0 # Background probability is always zero
-
 
             if slot == self.Probabilities:
                 return { t : self.prob_cache[t] for t in times }

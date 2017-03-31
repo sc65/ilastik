@@ -1,3 +1,4 @@
+import collections
 import numpy as np
 import numpy.lib.recfunctions as nlr
 import h5py
@@ -5,18 +6,22 @@ from vigra import AxisTags
 from lazyflow.utility import OrderedSignal
 from sys import stdout
 from zipfile import ZipFile
+from ilastik.applets.objectExtraction.opObjectExtraction import default_features_key
 import logging
 
 logger = logging.getLogger(__name__)
-
+try:
+    from ilastik.plugins import pluginManager
+except:
+    logger.warn('could not import pluginManager')
 
 class Default(object):
-    DivisionNames = {"names": ("timestep", "lineage_id", "parent_oid", "track_id", "child1_oid", "child_track1_id",
-                               "child2_oid", "child_track2_id")}
+    DivisionNames = {"names": ("timestep", "object_id", "lineage_id", "track_id", "child1_object_id", "child1_track_id", "child2_object_id", "child2_track_id")}
     ManualDivMap = [1, 0, 1, 1, 1, 1, 1, 1]
     KnimeId = {"names": ("object_id",)}
     IlastikId = {"names": ("timestep", "labelimage_oid")}
     Lineage = {"names": ("lineage_id",)}
+    TrackId = {"names": ("track_id",)}
     LabelRoiPath = "/images/{}/labeling"
     RawRoiPath = "/images/{}/raw"
     RawPath = "/images/raw"
@@ -52,80 +57,97 @@ def flatten_ilastik_feature_table(table, selection, signal):
     selection = list(selection)
     frames = table.meta.shape[0]
 
-    signal(0)
-    if frames > 1:
-        computed_feature = {}
-        for t in xrange(frames - 1):
-            request = table([t, t + 1])
-            computed_feature.update(request.wait())
-            signal(100 * t / frames)
-    else:
-        computed_feature = table([]).wait()
-    signal(100)
+    logger.info('Fetching object features for feature table...')
+    computed_feature = table([]).wait()
 
-    feature_names = []
-    feature_cats = []
+    signal(0)
+
+    feature_long_names = [] # For example, "Size in Pixels"
+    feature_short_names = [] # For example, "Count"
+    feature_plugins = []
     feature_channels = []
     feature_types = []
 
-    for cat_name, category in computed_feature[0].iteritems():
-        for feat_name, feat_array in category.iteritems():
-            if cat_name == "Default features" or \
-                    feat_name not in feature_names and \
-                    feat_name in selection:
-                feature_names.append(feat_name)
-                feature_cats.append(cat_name)
+    for plugin_name, feature_dict in computed_feature[0].iteritems():
+        all_props = None
+        
+        if plugin_name==default_features_key:
+            plugin = pluginManager.getPluginByName("Standard Object Features", "ObjectFeatures")
+        else:
+            plugin = pluginManager.getPluginByName(plugin_name, "ObjectFeatures")
+        if plugin:
+            plugin_feature_names = {el:{} for el in feature_dict.keys()}
+            all_props = plugin.plugin_object.fill_properties(plugin_feature_names) #fill in display name and such
+
+        for feat_name, feat_array in feature_dict.iteritems():
+            if all_props:
+                long_name = all_props[feat_name]["displaytext"]
+            else:
+                long_name = feat_name
+            if (plugin_name == default_features_key or \
+                     long_name in selection or \
+                     feat_name in selection) and \
+                     long_name not in feature_long_names:
+                feature_long_names.append(long_name)
+                feature_short_names.append(feat_name)
+                feature_plugins.append(plugin_name)
                 feature_channels.append((feat_array.shape[1]))
                 feature_types.append(feat_array.dtype)
 
+    signal(25)
+
     obj_count = []
     for t, cf in computed_feature.iteritems():
-        obj_count.append(cf["Default features"]["Count"].shape[0] - 1)  # no background
+        obj_count.append(cf[default_features_key]["Count"].shape[0] - 1)  # no background
+
+    signal(50)
 
     dtype_names = []
     dtype_types = []
     dtype_to_key = {}
 
-    for i, name in enumerate(feature_names):
+    for i, name in enumerate(feature_long_names):
         if feature_channels[i] > 1:
             for c in xrange(feature_channels[i]):
                 dtype_names.append("%s_%i" % (name, c))
                 dtype_types.append(feature_types[i].name)
-                dtype_to_key[dtype_names[-1]] = (feature_cats[i], name, c)
+                dtype_to_key[dtype_names[-1]] = (feature_plugins[i], feature_short_names[i], c)
         else:
             dtype_names.append(name)
             dtype_types.append(feature_types[i].name)
-            dtype_to_key[dtype_names[-1]] = (feature_cats[i], name, 0)
+            dtype_to_key[dtype_names[-1]] = (feature_plugins[i], feature_short_names[i], 0)
 
     feature_table = np.zeros((sum(obj_count),), dtype=",".join(dtype_types))
     feature_table.dtype.names = map(str, dtype_names)
+
+    signal(75)
 
     start = 0
     end = obj_count[0]
     for t, cf in computed_feature.iteritems():
         for name in dtype_names:
-            cat, feat_name, index = dtype_to_key[name]
-            feature_table[name][start:end] = cf[cat][feat_name][1:, index]
+            plugin, feat_name, index = dtype_to_key[name]
+            data_len = len(cf[plugin][feat_name][1:, index])
+            feature_table[name][start:start + data_len] = cf[plugin][feat_name][1:, index]
         start = end
         try:
             end += obj_count[int(t) + 1]
         except IndexError:
             end = sum(obj_count)
 
+    signal(100)
+
     return feature_table
 
 
-def objects_per_frame(labeling_image):
-    t_index = labeling_image.meta.axistags.index("t")
-    data = labeling_image([]).wait()
-    frames = data.shape[t_index]
+def objects_per_frame(label_image_slot):
+    t_index = label_image_slot.meta.axistags.index("t")
+    assert t_index == 0, "This function assumes that the first axis is time."    
 
-    if t_index != 0:
-        raise RuntimeError("FAIL")
-
-    for t in xrange(frames):
-        yield data[t].max()
-        #yield len(np.unique(data[t]))
+    num_frames = label_image_slot.meta.shape[0]
+    for t in xrange(num_frames):
+        frame_data = label_image_slot[t:t+1].wait()
+        yield frame_data.max()
 
 
 def division_flatten_dict(divisions, dict_):
@@ -155,19 +177,24 @@ def flatten_dict(dict_, object_count):
 def prepare_list(list_, names, dtypes=None):
     shape = (len(list_),)
     if dtypes is None:
-        if isinstance(list_[0], (tuple, list)):
-            dtypes = [np.dtype(type(i)).name for i in list_[0]]
-        else:
-            dtypes = [np.dtype(type(list_[0])).name]
+        first_row = list_[0]
+        if isinstance(first_row, str) or not isinstance(first_row, collections.Iterable):
+            list_ = zip(*[list_])
+            first_row = list_[0]
+
+        dtypes = []
+        for col, item in enumerate(first_row):
+            dtype_name = np.dtype(type(item)).name
+            if dtype_name == 'string':
+                maxlen = 1
+                for r_index, row_data in enumerate(list_):
+                    maxlen = max(maxlen, len(row_data[col]))
+                dtype_name = 'S{}'.format(maxlen)
+            dtypes.append(dtype_name)
+    
     array = np.zeros(shape, ",".join(dtypes))
     array.dtype = np.dtype([(names[i], dtypes[i]) for i in xrange(len(names))])
-
-    for i, row in enumerate(list_):
-        if len(names) == 1:
-            array[i] = (row, )
-        else:
-            array[i] = row
-
+    array[:] = list_
     return array
 
 
@@ -184,14 +211,14 @@ def create_slicing(axistags, dimensions, margin, feature_table):
     """
     assert margin >= 0, "Margin muss be greater than or equal to 0"
     time = feature_table[Default.TimeColumnName].astype(np.int32)
-    minx = feature_table["Coord<Minimum>_0"].astype(np.int32)
-    maxx = feature_table["Coord<Maximum>_0"].astype(np.int32)
-    miny = feature_table["Coord<Minimum>_1"].astype(np.int32)
-    maxy = feature_table["Coord<Maximum>_1"].astype(np.int32)
+    minx = feature_table["Bounding Box Minimum_0"].astype(np.int32)
+    maxx = feature_table["Bounding Box Maximum_0"].astype(np.int32)
+    miny = feature_table["Bounding Box Minimum_1"].astype(np.int32)
+    maxy = feature_table["Bounding Box Maximum_1"].astype(np.int32)
     table_shape = feature_table.shape[0]
     try:
-        minz = feature_table["Coord<Minimum>_2"].astype(np.int32)
-        maxz = feature_table["Coord<Maximum>_2"].astype(np.int32)
+        minz = feature_table["Bounding Box Minimum_2"].astype(np.int32)
+        maxz = feature_table["Bounding Box Maximum_2"].astype(np.int32)
     except ValueError:
         minz = maxz = [0] * table_shape
 

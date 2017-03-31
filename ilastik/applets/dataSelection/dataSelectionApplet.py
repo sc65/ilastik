@@ -18,6 +18,7 @@
 # on the ilastik web site at:
 #		   http://ilastik.org/license.html
 ###############################################################################
+from __future__ import division
 import os
 import glob
 import argparse
@@ -124,7 +125,7 @@ class DataSelectionApplet( Applet ):
             for arg_name in arg_names:
                 if getattr(parsed_args, arg_name):
                     # FIXME: This error message could be more helpful.
-                    role_args = map( self._role_name_to_arg_name, role_names )
+                    role_args = map( cls._role_name_to_arg_name, role_names )
                     role_args = map( lambda s: '--' + s, role_args )
                     role_args_str = ", ".join( role_args )
                     raise Exception("Invalid command line arguments: All roles must be configured explicitly.\n"
@@ -262,7 +263,7 @@ class DataSelectionApplet( Applet ):
             #  even if the dataset is located in the same location as a previous one and has the same globstring!
             # Create a sha-1 of the file name and modification date.
             sha = hashlib.sha1()
-            files = [k.replace('\\', '/') for k in glob.glob( path )]
+            files = sorted([k.replace('\\', '/') for k in glob.glob( path )])
             for f in files:
                 sha.update(f)
                 sha.update(pickle.dumps(os.stat(f).st_mtime))
@@ -297,6 +298,8 @@ class DataSelectionApplet( Applet ):
         return filePaths
 
     def configureRoleFromJson(self, lane, role, dataset_info_namespace):
+        assert sys.version_info.major == 2, "Alert! This function has not been tested "\
+        "under python 3. Please remove this assetion and be wary of any strnage behavior you encounter"
         opDataSelection = self.topLevelOperator
         logger.debug( "Configuring dataset for role {}".format( role ) )
         logger.debug( "Params: {}".format(dataset_info_namespace) )
@@ -307,7 +310,7 @@ class DataSelectionApplet( Applet ):
         if '*' in datasetInfo.filePath:
             totalProgress = [-100]
             def handleStackImportProgress( progress ):
-                if progress / 10 != totalProgress[0] / 10:
+                if progress // 10 != totalProgress[0] // 10:
                     totalProgress[0] = progress
                     logger.info( "Importing stack: {}%".format( totalProgress[0] ) )
             serializer = self.dataSerializers[0]

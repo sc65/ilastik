@@ -263,7 +263,10 @@ class SerialSlot(object):
             indexes_to_keys = { int(k) : k for k in subgroup.keys() }
             
             # Ensure the slot is at least big enough to deserialize into.
-            max_index = max( indexes_to_keys.keys() )
+            if indexes_to_keys.keys() == []:
+                max_index = 0
+            else:
+                max_index = max( indexes_to_keys.keys() )
             if len(slot) < max_index+1:
                 slot.resize(max_index+1)
 
@@ -347,7 +350,7 @@ class SerialListSlot(SerialSlot):
 class SerialBlockSlot(SerialSlot):
     """A slot which only saves nonzero blocks."""
     def __init__(self, slot, inslot, blockslot, name=None, subname=None,
-                 default=None, depends=None, selfdepends=True, shrink_to_bb=False):
+                 default=None, depends=None, selfdepends=True, shrink_to_bb=False, compression_level=0):
         """
         :param blockslot: provides non-zero blocks.
         :param shrink_to_bb: If true, reduce each block of data from the slot to  
@@ -361,6 +364,7 @@ class SerialBlockSlot(SerialSlot):
         self.blockslot = blockslot
         self._bind(slot)
         self._shrink_to_bb = shrink_to_bb
+        self.compression_level = compression_level
 
     def shouldSerialize(self, group):
         # Should this be a docstring?
@@ -450,7 +454,14 @@ class SerialBlockSlot(SerialSlot):
 
                     block_group = subgroup.create_group(blockName)
 
-                    block_group.create_dataset("data", data=block.data)
+                    if self.compression_level:
+                        block_group.create_dataset("data",
+                                                   data=block.data,
+                                                   compression='gzip',
+                                                   compression_opts=compression_level)
+                    else:
+                        block_group.create_dataset("data", data=block.data)
+                        
                     block_group.create_dataset(
                         "mask",
                         data=block.mask,
@@ -780,6 +791,43 @@ class SerialClassifierFactorySlot(SerialSlot):
             self._failed_to_deserialize = True
             warnings.warn("This project file uses an old or unsupported classifier storage format. "
                           "The classifier will be stored in the new format when you save your project.")
+        else:
+            slot.setValue( value )
+
+
+class SerialPickleableSlot(SerialSlot):
+    def __init__(self, slot, version, default, name=None):
+        super( SerialPickleableSlot, self ).__init__( slot, name=name )
+        self._failed_to_deserialize = False
+        self._version = version
+        self._default = default
+
+    def _saveValue(self, group, name, value):
+        pickled = pickle.dumps( value )
+        dset = group.create_dataset(name, data=pickled)
+        dset.attrs['version'] = self._version
+        self._failed_to_deserialize = False
+
+    def shouldSerialize(self, group):
+        if self._failed_to_deserialize:
+            return True
+        else:
+            return super(SerialPickleableSlot, self).shouldSerialize(group)
+
+    def _getValue(self, dset, slot):
+        try:
+            # first check that the version of the deserialized and the expected value are the same
+            loaded_version = dset.attrs['version']
+            assert loaded_version == self._version
+
+            # Attempt to unpickle
+            pickled = dset[()]
+            value = pickle.loads(pickled)
+        except:
+            self._failed_to_deserialize = True
+            warnings.warn("This project file uses an old or unsupported storage format. "
+                          "When save the project the next time, it will be stored in the new format.")
+            slot.setValue(self._default)
         else:
             slot.setValue( value )
 

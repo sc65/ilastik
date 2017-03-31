@@ -39,10 +39,11 @@ from volumina.utility import PreferencesManager
 
 #lazyflow
 import lazyflow
+from lazyflow.utility import chunked_bincount
 from lazyflow.roi import TinyVector, roiToSlice, roiFromShape
 from lazyflow.operators.ioOperators import OpInputDataReader
 from lazyflow.operators.opReorderAxes import OpReorderAxes
-from lazyflow.operators.opArrayCache import OpArrayCache
+from lazyflow.operators.opBlockedArrayCache import OpBlockedArrayCache
 from lazyflow.operators.valueProviders import OpMetadataInjector
 
 # ilastik
@@ -84,64 +85,79 @@ def import_labeling_layer(labelLayer, labelingSlots, parent_widget=None):
     try:
         # Initialize operators
         opImport = OpInputDataReader( parent=opLabels.parent )
-        opCache = OpArrayCache( parent=opLabels.parent )
+        opCache = OpBlockedArrayCache( parent=opLabels.parent )
         opMetadataInjector = OpMetadataInjector( parent=opLabels.parent )
         opReorderAxes = OpReorderAxes( parent=opLabels.parent )
     
         # Set up the pipeline as follows:
         #
-        #   opImport --> opCache --> opMetadataInjector --------> opReorderAxes --(inject via setInSlot)--> labelInput
-        #                           /                            /
-        #   User-specified axisorder    labelInput.meta.axistags
+        #   opImport --> (opCache) --> opMetadataInjector --------> opReorderAxes --(inject via setInSlot)--> labelInput
+        #                             /                            /
+        #     User-specified axisorder    labelInput.meta.axistags
     
         opImport.WorkingDirectory.setValue(defaultDirectory)
         opImport.FilePath.setValue(fileNames[0] if len(fileNames) == 1 else
                                    os.path.pathsep.join(fileNames))
         assert opImport.Output.ready()
-    
-        opCache.blockShape.setValue( opImport.Output.meta.shape )
-        opCache.Input.connect( opImport.Output )
-        assert opCache.Output.ready()
 
-        opMetadataInjector.Input.connect( opCache.Output )
-        metadata = opCache.Output.meta.copy()
+        maxLabels = len(labelingSlots.labelNames.value)
+    
+        # We don't bother with counting the label pixels
+        # (and caching the data) if it's big (1 GB)
+        if numpy.prod(opImport.Output.meta.shape) > 1e9:
+            reading_slot = opImport.Output
+            
+            # For huge data, we don't go through and search for the pixel values,
+            # because that takes an annoyingly long amount of time.
+            # Instead, we make the reasonable assumption that the input labels are already 1,2,3..N
+            # and we don't tell the user what the label pixel counts are.
+            unique_read_labels = numpy.array(range(maxLabels+1))
+            readLabelCounts = numpy.array([-1]*(maxLabels+1))
+            labelInfo = (maxLabels, (unique_read_labels, readLabelCounts))
+        else:    
+            opCache.Input.connect( opImport.Output )
+            opCache.CompressionEnabled.setValue(True)
+            assert opCache.Output.ready()
+            reading_slot = opCache.Output
+
+            # We'll show a little window with a busy indicator while the data is loading
+            busy_dlg = QProgressDialog(parent=parent_widget)
+            busy_dlg.setLabelText("Scanning Label Data...")
+            busy_dlg.setCancelButton(None)
+            busy_dlg.setMinimum(100)
+            busy_dlg.setMaximum(100)
+            def close_busy_dlg(*args):
+                QApplication.postEvent(busy_dlg, QCloseEvent())
+        
+            # Load the data from file into our cache
+            # When it's done loading, close the progress dialog.
+            req = reading_slot[:]
+            req.notify_finished( close_busy_dlg )
+            req.notify_failed( close_busy_dlg )
+            req.submit()
+            busy_dlg.exec_()
+    
+            readData = req.result
+
+            # Can't use return_counts feature because that requires numpy >= 1.9
+            #unique_read_labels, readLabelCounts = numpy.unique(readData, return_counts=True)
+    
+            # This does the same as the above, albeit slower, and probably with more ram.
+            bincounts = chunked_bincount(readData)
+            unique_read_labels = bincounts.nonzero()[0].astype(readData.dtype, copy=False)
+            readLabelCounts = bincounts[unique_read_labels]
+    
+            labelInfo = (maxLabels, (unique_read_labels, readLabelCounts))
+            del readData
+    
+        opMetadataInjector.Input.connect( reading_slot )
+        metadata = reading_slot.meta.copy()
         opMetadataInjector.Metadata.setValue( metadata )
-        opReorderAxes.Input.connect( opImport.Output )
+        opReorderAxes.Input.connect( opMetadataInjector.Output )
 
         # Transpose the axes for assignment to the labeling operator.
         opReorderAxes.AxisOrder.setValue( writeSeeds.meta.getAxisKeys() )
-    
-        # We'll show a little window with a busy indicator while the data is loading
-        busy_dlg = QProgressDialog(parent=parent_widget)
-        busy_dlg.setLabelText("Importing Label Data...")
-        busy_dlg.setCancelButton(None)
-        busy_dlg.setMinimum(100)
-        busy_dlg.setMaximum(100)
-        def close_busy_dlg(*args):
-            QApplication.postEvent(busy_dlg, QCloseEvent())
-    
-        # Load the data from file into our cache
-        # When it's done loading, close the progress dialog.
-        req = opCache.Output[:]
-        req.notify_finished( close_busy_dlg )
-        req.notify_failed( close_busy_dlg )
-        req.submit()
-        busy_dlg.exec_()
 
-        readData = req.result
-        
-        maxLabels = len(labelingSlots.labelNames.value)
-
-        # Can't use return_counts feature because that requires numpy >= 1.9
-        #unique_read_labels, readLabelCounts = numpy.unique(readData, return_counts=True)
-
-        # This does the same as the above, albeit slower, and probably with more ram.
-        unique_read_labels = numpy.unique(readData)
-        readLabelCounts = numpy.bincount(readData.flat)[unique_read_labels]
-
-        labelInfo = (maxLabels, (unique_read_labels, readLabelCounts))
-        del readData
-    
         # Ask the user how to interpret the data.
         settingsDlg = LabelImportOptionsDlg( parent_widget,
                                              fileNames, opMetadataInjector.Output,
@@ -153,7 +169,16 @@ def import_labeling_layer(labelLayer, labelingSlots, parent_widget=None):
             metadata = opMetadataInjector.Metadata.value.copy()
             metadata.axistags = vigra.defaultAxistags(updated_axisorder)
             opMetadataInjector.Metadata.setValue( metadata )
+            
+            if opReorderAxes._invalid_axes:
+                settingsDlg.buttonBox.button(QDialogButtonBox.Ok).setEnabled(False)
+                # Red background
+                settingsDlg.axesEdit.setStyleSheet("QLineEdit { background: rgb(255, 128, 128);"
+                                                   "selection-background-color: rgb(128, 128, 255); }")
         settingsDlg.axesEdit.editingFinished.connect( handle_updated_axes )
+        
+        # Initialize
+        handle_updated_axes()
 
         dlg_result = settingsDlg.exec_()
         if dlg_result != LabelImportOptionsDlg.Accepted:
@@ -162,19 +187,17 @@ def import_labeling_layer(labelLayer, labelingSlots, parent_widget=None):
         # Get user's chosen label mapping from dlg
         labelMapping = settingsDlg.labelMapping    
 
-        # Get user's chosen offsets.
-        # Offsets in dlg only include the file axes, not the 5D axes expected by the label input,
-        # so expand them to full 5D 
+        # Get user's chosen offsets, ordered by the 'write seeds' slot
         axes_5d = opReorderAxes.Output.meta.getAxisKeys()
         tagged_offsets = collections.OrderedDict( zip( axes_5d, [0]*len(axes_5d) ) )
-        tagged_offsets.update( dict( zip( opMetadataInjector.Output.meta.getAxisKeys(), settingsDlg.imageOffsets ) ) )
+        tagged_offsets.update( dict( zip( opReorderAxes.Output.meta.getAxisKeys(), settingsDlg.imageOffsets ) ) )
         imageOffsets = tagged_offsets.values()
 
         # Optimization if mapping is identity
         if labelMapping.keys() == labelMapping.values():
             labelMapping = None
 
-        # This will be fast (it's already cached)
+        # If the data was already cached, this will be fast.
         label_data = opReorderAxes.Output[:].wait()
         
         # Map input labels to output labels
@@ -227,10 +250,16 @@ class LabelImportOptionsDlg(QDialog):
         self._insert_position_boxes = collections.OrderedDict()
         self._insert_mapping_boxes = collections.OrderedDict()
 
-        # Result values
-        output_tagged_shape = writeSeedsSlot.meta.getTaggedShape()
-        writeSeedsShape = map( lambda k: output_tagged_shape[k], dataInputSlot.meta.getAxisKeys() )
-        axisRanges = numpy.array(writeSeedsShape) - dataInputSlot.meta.shape
+        write_seeds_tagged_shape = writeSeedsSlot.meta.getTaggedShape()
+        label_data_tagged_shape = dataInputSlot.meta.getTaggedShape()
+
+        axisRanges = ()
+        for k in write_seeds_tagged_shape.keys():
+            try:
+                axisRanges += (write_seeds_tagged_shape[k] - label_data_tagged_shape[k],)
+            except KeyError:
+                axisRanges += (write_seeds_tagged_shape[k],)
+
         self.imageOffsets = LabelImportOptionsDlg._defaultImageOffsets(axisRanges, srcInputFiles, dataInputSlot)
         self.labelMapping = LabelImportOptionsDlg._defaultLabelMapping(labelInfo)
 
@@ -245,7 +274,7 @@ class LabelImportOptionsDlg(QDialog):
 
         self._dataInputSlot.notifyMetaChanged( self._initInsertPositionMappingWidgets )
         self._dataInputSlot.notifyMetaChanged( self._initWarningLabel )
-
+        
     def closeEvent(self, e):
         # Clean-up
         self._dataInputSlot.unregisterMetaChanged( self._initInsertPositionMappingWidgets )
@@ -270,17 +299,14 @@ class LabelImportOptionsDlg(QDialog):
 
     @staticmethod
     def _defaultLabelMapping(labelInfo):
-        # Note: Default mapping prefers mapping
-        label_mapping = collections.defaultdict(int)
-
         max_labels, read_labels_info = labelInfo
-        labels, label_counts = read_labels_info
-        label_idx = max_labels;
+        labels, _label_counts = read_labels_info
+        label_idx = max_labels
 
-        for i in reversed(labels):
-            label_mapping[i] = label_idx if i > 0 else 0
-            label_idx = max(0, label_idx - 1)
+        if 0 not in labels:
+            labels = [0] + list(labels)
 
+        label_mapping = collections.defaultdict(int, zip(labels, range(max_labels)))
         return label_mapping
 
 
@@ -306,6 +332,14 @@ class LabelImportOptionsDlg(QDialog):
         self.labelMetaInfoWidget.setEnabled( state == QValidator.Acceptable )
         self.positionWidget.setEnabled( state == QValidator.Acceptable )
         self.buttonBox.button(QDialogButtonBox.Ok).setEnabled( state == QValidator.Acceptable )
+        if state != QValidator.Acceptable:
+            # Red background
+            self.axesEdit.setStyleSheet("QLineEdit { background: rgb(255, 128, 128);"
+                                        "selection-background-color: rgb(128, 128, 255); }")
+        else:
+            # White background
+            self.axesEdit.setStyleSheet("QLineEdit { background: rgb(255, 255, 255);"
+                                        "selection-background-color: rgb(128, 128, 128); }")
         
     class _QAxesValidator(QValidator):
         def __init__(self, expected_length, parent=None):
@@ -370,26 +404,30 @@ class LabelImportOptionsDlg(QDialog):
         if not self._dataInputSlot.ready():
             return
 
-        output_tagged_shape = self._writeSeedsSlot.meta.getTaggedShape()
-        writeSeedsShape = map( lambda k: output_tagged_shape[k], self._dataInputSlot.meta.getAxisKeys() )
-        axisRanges = numpy.array(writeSeedsShape) - self._dataInputSlot.meta.shape
-        maxValues = list(axisRanges)
+        write_seeds_tagged_shape = self._writeSeedsSlot.meta.getTaggedShape()
+        label_data_tagged_shape = self._dataInputSlot.meta.getTaggedShape()
+        axisRanges = ()
+        for k in write_seeds_tagged_shape.keys():
+            try:
+                axisRanges += (write_seeds_tagged_shape[k] - label_data_tagged_shape[k],)
+            except KeyError:
+                axisRanges += (write_seeds_tagged_shape[k],)
 
         # Handle the 'c' axis separately
-        inputAxes = self._dataInputSlot.meta.getAxisKeys()
+        inputAxes = self._writeSeedsSlot.meta.getAxisKeys()
         try:
             c_idx = inputAxes.index('c')
         except ValueError:
             inputAxes_noC = inputAxes
-            maxValues_noC = maxValues
+            maxValues_noC = axisRanges
         else:
             inputAxes_noC = inputAxes[:c_idx] + inputAxes[c_idx+1:]  # del(list(inputAxes)[c_idx])
-            maxValues_noC = maxValues[:c_idx] + maxValues[c_idx+1:]  # del(list(maxValues)[c_idx])
+            maxValues_noC = axisRanges[:c_idx] + axisRanges[c_idx+1:]  # del(list(maxValues)[c_idx])
 
         self._initInsertPositionTableWithExtents(inputAxes_noC, maxValues_noC)
         self._initLabelMappingTableWithExtents()
 
-        if (axisRanges < 0).any():
+        if (numpy.asarray(axisRanges) < 0).any():
             self.positionWidget.setEnabled( False )
 
         # The OK button should have the same status as the positionWidget
@@ -506,11 +544,11 @@ class LabelImportOptionsDlg(QDialog):
     # Update Position / Mapping
     #**************************************************************************
     def _updatePosition(self):
-        inputAxes = self._dataInputSlot.meta.getAxisKeys()
+        writeAxes = self._writeSeedsSlot.meta.getAxisKeys()
 
         for (k,v) in self._insert_position_boxes.items():
             insertBox, _ = v
-            self.imageOffsets[inputAxes.index(k)] = insertBox.value()
+            self.imageOffsets[writeAxes.index(k)] = insertBox.value()
 
     def _updateMappingEnabled(self):
         max_labels, _ = self._labelInfo

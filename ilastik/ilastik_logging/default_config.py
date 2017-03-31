@@ -22,8 +22,9 @@ import os
 import logging.config
 import warnings
 import loggingHelpers
+from ilastik.config import cfg as ilastik_config
 
-DEFAULT_LOGFILE_PATH = os.path.expanduser("~/.ilastik_log.txt")
+DEFAULT_LOGFILE_PATH = os.path.expanduser("~/ilastik_log.txt")
 
 class OutputMode:
     CONSOLE = 0
@@ -143,6 +144,8 @@ def get_default_config( prefix="",
             
             # The requests module spits out a lot of INFO messages by default.
             "requests": {"level":"WARN"},
+
+            "wsdt": { "level": "INFO" },
     
             # When copying to a json file, remember to remove comments and change True/False to true/false
             "__main__":                                                 { "level":"INFO" },
@@ -165,8 +168,9 @@ def get_default_config( prefix="",
             "lazyflow.operators.ioOperators.ioOperators.OpH5WriterBigDataset":   { "level":"INFO" },
             "lazyflow.operators.classifierOperators":                   { "level":"INFO" },
             "lazyflow.operators.opCompressedCache":                     { "level":"INFO" },
-            "lazyflow.utility.io.RESTfulVolume":                        { "level":"INFO" },
-            "lazyflow.utility.io.tiledVolume":                          { "level":"INFO" },
+            "lazyflow.operators.opRelabelConsecutive":                  { "level":"INFO" },
+            "lazyflow.utility.io_util.RESTfulVolume":                        { "level":"INFO" },
+            "lazyflow.utility.io_util.tiledVolume":                          { "level":"INFO" },
             "lazyflow.operators.opFeatureMatrixCache":                  { "level":"INFO" },
             "lazyflow.operators.opConcatenateFeatureMatrices":          { "level":"INFO" },
             "lazyflow.utility.roiRequestBatch":                         { "level":"INFO" },
@@ -182,7 +186,7 @@ def get_default_config( prefix="",
             "ilastik.applets.thresholdTwoLevels.ipht":                  { "level":"INFO" },
             "ilastik.applets.objectExtraction":                         { "level":"INFO" },
             "ilastik.applets.blockwiseObjectClassification":            { "level":"INFO" },
-            "ilastik.applets.splitBodyCarving":                         { "level":"INFO" },
+            "ilastik.applets.tracking.conservation":                    { "level":"INFO" },
             "ilastik.shell":                                            { "level":"INFO" },
             "ilastik.shell.projectManager":                             { "level":"INFO" },
             "ilastik.shell.gui.ipcManager":                             { "level":"INFO" },
@@ -222,12 +226,20 @@ def get_default_config( prefix="",
     return default_log_config
 
 def init(format_prefix="", output_mode=OutputMode.LOGFILE_WITH_CONSOLE_ERRORS, logfile_path=DEFAULT_LOGFILE_PATH):
-    if output_mode == "/dev/null":
+    if logfile_path == "/dev/null":
         assert output_mode != OutputMode.LOGFILE, "Must enable a logging mode."
         output_mode = OutputMode.CONSOLE
 
+    # Preserve pre-existing handlers
+    original_root_handlers = list(logging.getLogger().handlers)
+
     # Start with the default
-    logging.config.dictConfig( get_default_config( format_prefix, output_mode, logfile_path ) )
+    default_config = get_default_config( format_prefix, output_mode, logfile_path )
+    logging.config.dictConfig( default_config )
+
+    # Preserve pre-existing handlers
+    for handler in original_root_handlers:
+        logging.getLogger().addHandler(handler)
     
     # Update from the user's customizations
     loggingHelpers.updateFromConfigFile()
@@ -240,6 +252,15 @@ def init(format_prefix="", output_mode=OutputMode.LOGFILE_WITH_CONSOLE_ERRORS, l
 
     # Don't warn about pending deprecations (PyQt generates some of these)
     warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
+
+    # Don't warn about duplicate python bindings for opengm
+    # (We import opengm twice, as 'opengm' 'opengm_with_cplex'.)
+    warnings.filterwarnings("ignore", message='.*to-Python converter for .*opengm.*', category=RuntimeWarning)
+
+    # Hide all other python converter warnings unless we're in debug mode.
+    if not ilastik_config.getboolean("ilastik", "debug"):
+        warnings.filterwarnings("ignore", message='.*to-Python converter for .*second conversion method ignored.*', category=RuntimeWarning)
+        
     
     # Custom format for warnings
     def simple_warning_format(message, category, filename, lineno, line=None):

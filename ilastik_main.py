@@ -4,8 +4,6 @@ import os
 import ilastik.config
 from ilastik.config import cfg as ilastik_config
 
-from lazyflow.utility import Memory
-
 import logging
 logger = logging.getLogger(__name__)
 
@@ -15,6 +13,7 @@ parser = argparse.ArgumentParser( description="start an ilastik workflow" )
 # Common options
 parser.add_argument('--headless', help="Don't start the ilastik gui.", action='store_true', default=False)
 parser.add_argument('--project', help='A project file to open on startup.', required=False)
+parser.add_argument('--readonly', help="Open all projects in read-only mode, to ensure you don't accidentally make changes.", default=False)
 
 parser.add_argument('--new_project', help='Create a new project with the specified name.  Must also specify --workflow.', required=False)
 parser.add_argument('--workflow', help='When used with --new_project, specifies the workflow to use.', required=False)
@@ -34,19 +33,24 @@ parser.add_argument('--playback_speed', help='Speed to play the playback script.
 parser.add_argument('--exit_on_failure', help='Immediately call exit(1) if an unhandled exception occurs.', action='store_true', default=False)
 parser.add_argument('--exit_on_success', help='Quit the app when the playback is complete.', action='store_true', default=False)
 
-def main( parsed_args, workflow_cmdline_args=[] ):
+def main( parsed_args, workflow_cmdline_args=[], init_logging=True ):
+    """
+    init_logging: Skip logging config initialization by setting this to False.
+                  (Useful when opening multiple projects in a Python script.)
+    """
     this_path = os.path.dirname(__file__)
     ilastik_dir = os.path.abspath(os.path.join(this_path, "..%s.." % os.path.sep))
+    _update_debug_mode( parsed_args )
     
     # If necessary, redirect stdout BEFORE logging is initialized
     _redirect_output( parsed_args )
-    _init_logging( parsed_args ) # Initialize logging before anything else
+
+    if init_logging:
+        _init_logging( parsed_args ) # Initialize logging before anything else
 
     _init_configfile( parsed_args )
     
-    _update_debug_mode( parsed_args )
     _init_threading_logging_monkeypatch()
-    _init_threading_h5py_monkeypatch()
     _validate_arg_compatibility( parsed_args )
 
     # Extra initialization functions.
@@ -171,25 +175,6 @@ def _init_threading_logging_monkeypatch():
             thread_start_logger.debug( "Started thread: id={:x}, name={}".format( self.ident, self.name ) )
         threading.Thread.start = logged_start
 
-def _init_threading_h5py_monkeypatch():
-    """
-    Due to an h5py bug [1], spurious error messages aren't properly 
-    hidden if they occur in any thread other than the main thread.
-    As a workaround, here we monkeypatch threading.Thread.run() to 
-    make sure all threads silence errors from h5py.
-    
-    [1]: https://github.com/h5py/h5py/issues/580
-    See also: https://github.com/ilastik/ilastik/issues/1120
-    """
-    import h5py
-    if h5py.__version__ <= '2.5.0':
-        import threading
-        run_old = threading.Thread.run
-        def run(*args, **kwargs):
-            h5py._errors.silence_errors()
-            run_old(*args, **kwargs)
-        threading.Thread.run = run
-
 def _validate_arg_compatibility( parsed_args ):
     # Check for bad input options
     if parsed_args.workflow is not None and parsed_args.new_project is None:
@@ -223,6 +208,7 @@ def _prepare_lazyflow_config( parsed_args ):
     # Check environment variable settings.
     n_threads = os.getenv("LAZYFLOW_THREADS", None)
     total_ram_mb = os.getenv("LAZYFLOW_TOTAL_RAM_MB", None)
+    status_interval_secs = int( os.getenv("LAZYFLOW_STATUS_MONITOR_SECONDS", "0") )
 
     # Convert str -> int
     if n_threads is not None:
@@ -237,10 +223,18 @@ def _prepare_lazyflow_config( parsed_args ):
     total_ram_mb = total_ram_mb or ilastik_config.getint('lazyflow', 'total_ram_mb')
     
     # Note that n_threads == 0 is valid and useful for debugging.
-    if (n_threads is not None) or total_ram_mb:
+    if (n_threads is not None) or total_ram_mb or status_interval_secs:
         def _configure_lazyflow_settings():
             import lazyflow
             import lazyflow.request
+            from lazyflow.utility import Memory
+            from lazyflow.operators.cacheMemoryManager import CacheMemoryManager
+
+            if status_interval_secs:
+                memory_logger = logging.getLogger('lazyflow.operators.cacheMemoryManager')
+                memory_logger.setLevel(logging.DEBUG)
+                CacheMemoryManager().setRefreshInterval(status_interval_secs)
+
             if n_threads is not None:
                 logger.info("Resetting lazyflow thread pool with {} threads.".format( n_threads ))
                 lazyflow.request.Request.reset_thread_pool(n_threads)
@@ -256,22 +250,57 @@ def _prepare_lazyflow_config( parsed_args ):
         return _configure_lazyflow_settings
     return None
 
+def _monkey_patch_h5py(shell):
+    """
+    This workaround avoids error messages from HDF5 when accessing non-existing
+    files, datasets, and dataset attributes from non-main threads.
+
+    See also:
+    - https://github.com/h5py/h5py/issues/580
+    - https://github.com/h5py/h5py/issues/582
+    """
+    import os
+    import h5py
+
+    old_dataset_getitem = h5py.Group.__getitem__
+    def new_dataset_getitem(group, key):
+        if key not in group:
+            raise KeyError("Unable to open object (Object '{}' doesn't exist)".format( key ))
+        return old_dataset_getitem(group, key)
+    h5py.Group.__getitem__ = new_dataset_getitem
+
+    old_file_init = h5py.File.__init__
+    def new_file_init(f, name, mode=None, driver=None, libver=None, userblock_size=None, **kwds):#, swmr=False, **kwds):
+        if isinstance(name, (str, buffer)) and (mode is None or mode == 'a'):
+            if not os.path.exists(name):
+                mode = 'w'
+        old_file_init(f, name, mode, driver, libver, userblock_size, **kwds)#, swmr, **kwds)
+    h5py.File.__init__ = new_file_init
+
+    old_attr_getitem = h5py._hl.attrs.AttributeManager.__getitem__
+    def new_attr_getitem(attrs, key):
+        if key not in attrs:
+            raise KeyError("Can't open attribute (Can't locate attribute: '{}')".format(key))
+        return old_attr_getitem(attrs, key)
+    h5py._hl.attrs.AttributeManager.__getitem__ = new_attr_getitem
+
 def _prepare_auto_open_project( parsed_args ):
     if parsed_args.project is None:
         return None
 
+    from lazyflow.utility.pathHelpers import PathComponents, isUrl
+
     # Make sure project file exists.
-    if not os.path.exists(parsed_args.project):
+    if not isUrl(parsed_args.project) and not os.path.exists(parsed_args.project):
         raise RuntimeError("Project file '" + parsed_args.project + "' does not exist.")
 
     parsed_args.project = os.path.expanduser(parsed_args.project)
     #convert path to convenient format
-    from lazyflow.utility.pathHelpers import PathComponents
     path = PathComponents(parsed_args.project).totalPath()
     
     def loadProject(shell):
         # This should work for both the IlastikShell and the HeadlessShell
-        shell.openProjectFile(path)
+        shell.openProjectFile(path, parsed_args.readonly)
     return loadProject
 
 def _prepare_auto_create_new_project( parsed_args ):

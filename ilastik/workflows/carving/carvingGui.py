@@ -22,6 +22,7 @@
 import os
 import tempfile
 from functools import partial
+from collections import defaultdict
 import numpy
 
 #PyQt
@@ -71,7 +72,6 @@ class CarvingGui(LabelingGui):
         labelingSlots.labelNames       = topLevelOperatorView.LabelNames
         labelingSlots.labelDelete      = topLevelOperatorView.opLabelArray.DeleteLabel
         labelingSlots.maxLabelValue    = topLevelOperatorView.opLabelArray.MaxLabelValue
-        labelingSlots.labelsAllowed    = topLevelOperatorView.LabelsAllowed
         
         # We provide our own UI file (which adds an extra control for interactive mode)
         directory = os.path.split(__file__)[0]
@@ -80,8 +80,7 @@ class CarvingGui(LabelingGui):
         self.dialogdirCOM = os.path.join(directory, 'carvingObjectManagement.ui')
         self.dialogdirSAD = os.path.join(directory, 'saveAsDialog.ui')
 
-        rawInputSlot = topLevelOperatorView.RawData        
-        super(CarvingGui, self).__init__(parentApplet, labelingSlots, topLevelOperatorView, drawerUiPath, rawInputSlot)
+        super(CarvingGui, self).__init__(parentApplet, labelingSlots, topLevelOperatorView, drawerUiPath)
         
         self.labelingDrawerUi.currentObjectLabel.setText("<not saved yet>")
 
@@ -99,13 +98,21 @@ class CarvingGui(LabelingGui):
                                        self.labelingDrawerUi.segment.click,
                                        self.labelingDrawerUi.segment,
                                        self.labelingDrawerUi.segment  ) )
+
         
-        try:
-            self.render = True
-            self._shownObjects3D = {}
-            self._renderMgr = RenderingManager( self.editor.view3d)
-        except:
-            self.render = False
+        # Disable 3D view by default
+        self.render = False
+        tagged_shape = defaultdict(lambda: 1)
+        tagged_shape.update( topLevelOperatorView.InputData.meta.getTaggedShape() )
+        is_3d = (tagged_shape['x'] > 1 and tagged_shape['y'] > 1 and tagged_shape['z'] > 1)
+
+        if is_3d:
+            try:
+                self._renderMgr = RenderingManager( self.editor.view3d )
+                self._shownObjects3D = {}
+                self.render = True
+            except:
+                self.render = False
 
         # Segmentation is toggled on by default in _after_init, below.
         # (We can't enable it until the layers are all present.)
@@ -225,18 +232,6 @@ class CarvingGui(LabelingGui):
         addLayerToggleShortcut("Completed segments (unicolor)", "d")
         addLayerToggleShortcut("Segmentation", "s")
         addLayerToggleShortcut("Input Data", "r")
-
-        '''
-        def updateLayerTimings():
-            s = "Layer timings:\n"
-            for l in self.layerstack:
-                s += "%s: %f sec.\n" % (l.name, l.averageTimePerTile)
-            self.labelingDrawerUi.layerTimings.setText(s)
-        t = QTimer(self)
-        t.setInterval(1*1000) # 10 seconds
-        t.start()
-        t.timeout.connect(updateLayerTimings)
-        '''
 
         def makeColortable():
             self._doneSegmentationColortable = [QColor(0,0,0,0).rgba()]
@@ -600,7 +595,7 @@ class CarvingGui(LabelingGui):
         ctable = self._doneSegmentationLayer.colorTable
 
         for name, label in self._shownObjects3D.iteritems():
-            color = QColor(ctable[op.MST.value.objects[name]])
+            color = QColor(ctable[op.MST.value.object_names[name]])
             color = (color.red() / 255.0, color.green() / 255.0, color.blue() / 255.0)
             self._renderMgr.setColor(label, color)
 
@@ -730,16 +725,20 @@ class CarvingGui(LabelingGui):
             layer.opacity = 1.0
             layers.append(layer)
 
-        #raw data
-        rawSlot = self.topLevelOperatorView.RawData
-        if rawSlot.ready():
-            raw5D = self.topLevelOperatorView.RawData.value
-            layer = GrayscaleLayer(ArraySource(raw5D), direct=True)
-            #layer = GrayscaleLayer( LazyflowSource(rawSlot) )
+        # Visual overlay (just for easier labeling)
+        overlaySlot = self.topLevelOperatorView.OverlayData
+        if overlaySlot.ready():
+            overlay5D = self.topLevelOperatorView.OverlayData.value
+            layer = GrayscaleLayer(ArraySource(overlay5D), direct=True)
             layer.visible = True
-            layer.name = 'Raw Data'
+            layer.name = 'Overlay'
             layer.opacity = 1.0
+            # if the flag window_leveling is set the contrast 
+            # of the layer is adjustable
+            layer.window_leveling = True
+            self.labelingDrawerUi.thresToolButton.show()
             layers.append(layer)
+            del layer
 
         inputSlot = self.topLevelOperatorView.InputData
         if inputSlot.ready():
@@ -749,15 +748,17 @@ class CarvingGui(LabelingGui):
             #layer.visible = not rawSlot.ready()
             layer.visible = True
             layer.opacity = 1.0
-            # if the flag window_leveling is set the contrast 
-            # of the layer is adjustable
-            layer.window_leveling = True
-            layers.append(layer)
 
-            if layer.window_leveling:
+            # Window leveling is already active on the Overlay,
+            # but if no overlay was provided, then activate window_leveling on the raw data instead.
+            if not overlaySlot.ready():
+                # if the flag window_leveling is set the contrast 
+                # of the layer is adjustable
+                layer.window_leveling = True
                 self.labelingDrawerUi.thresToolButton.show()
-            else:
-                self.labelingDrawerUi.thresToolButton.hide()
+
+            layers.append(layer)
+            del layer
 
         filteredSlot = self.topLevelOperatorView.FilteredInputData
         if filteredSlot.ready():

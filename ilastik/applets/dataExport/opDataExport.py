@@ -65,6 +65,10 @@ class OpDataExport(Operator):
     OutputInternalPath = InputSlot(value='exported_data')
     OutputFormat = InputSlot(value='hdf5')
     
+    # Only export csv/HDF5 table (don't export volume)
+    TableOnlyName = InputSlot(value='Table-Only')
+    TableOnly = InputSlot(value=False)
+    
     ExportPath = OutputSlot() # Location of the saved file after export is complete.
     
     ConvertedImage = OutputSlot() # Cropped image, not yet re-ordered (useful for guis)
@@ -205,7 +209,11 @@ class OpDataExport(Operator):
             return
         self._opFormattedExport.Input.connect( self.Inputs[selection_index] )
 
-        dataset_dir = PathComponents(rawInfo.filePath).externalDirectory
+        if os.path.pathsep in rawInfo.filePath:
+            first_dataset = rawInfo.filePath.split(os.path.pathsep)[0]
+            dataset_dir = PathComponents(first_dataset).externalDirectory
+        else:
+            dataset_dir = PathComponents(rawInfo.filePath).externalDirectory
         abs_dataset_dir, _ = getPathVariants(dataset_dir, self.WorkingDirectory.value)
         known_keys = {}        
         known_keys['dataset_dir'] = abs_dataset_dir
@@ -255,13 +263,18 @@ class OpDataExport(Operator):
             self._opImageOnDiskProvider.Dirty.setValue( False )
 
     def run_export(self):
-        # If we're not dirty, we don't have to do anything.
-        if self.Dirty.value:
+        # If Table-Only is disabled or we're not dirty, we don't have to do anything.
+        if not self.TableOnly.value and self.Dirty.value:
             self.cleanupOnDiskView()
             self._opFormattedExport.run_export()
             self.Dirty.setValue( False )
             self.setupOnDiskView()
             self._opImageOnDiskProvider.Dirty.setValue( False )
+
+    def run_export_to_array(self):
+        # This function can be used to export the results to an in-memory array, instead of to disk
+        # (Typically used from pure-python clients in batch mode.)
+        return self._opFormattedExport.run_export_to_array()
 
 class OpRawSubRegionHelper(Operator):
     """
@@ -354,6 +367,7 @@ class OpImageOnDiskProvider(Operator):
             metadata = {}
             metadata['axistags'] = self.Input.meta.axistags
             metadata['drange'] = self.Input.meta.drange
+            metadata['display_mode'] = self.Input.meta.display_mode
             self._opMetadataInjector = OpMetadataInjector( parent=self )
             self._opMetadataInjector.Input.connect( self._opReader.Output )
             self._opMetadataInjector.Metadata.setValue( metadata )

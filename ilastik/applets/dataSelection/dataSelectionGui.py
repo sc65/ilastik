@@ -25,6 +25,7 @@ import h5py
 import numpy
 from functools import partial
 import logging
+from __builtin__ import False
 logger = logging.getLogger(__name__)
 
 #PyQt
@@ -55,7 +56,7 @@ from datasetDetailedInfoTableModel import DatasetDetailedInfoColumn, DatasetDeta
 from datasetDetailedInfoTableView import DatasetDetailedInfoTableView
 
 try:
-    import pydvid
+    import libdvid
     _has_dvid_support = True
 except:
     _has_dvid_support = False
@@ -687,17 +688,27 @@ class DataSelectionGui(QWidget):
 
     @threadRouted
     def handleDatasetConstraintError(self, info, filename, ex, roleIndex, laneIndex, return_val=[False]):
-        msg = "Can't use default properties for dataset:\n\n" + \
-              filename + "\n\n" + \
-              "because it violates a constraint of the {} applet.\n\n".format( ex.appletName ) + \
-              ex.message + "\n\n" + \
-              "Please enter valid dataset properties to continue."
-        QMessageBox.warning( self, "Dataset Needs Correction", msg )
+        if ex.unfixable:
+            msg = ( "Can't use dataset:\n\n"
+                    + filename + "\n\n"
+                    + "because it violates a constraint of the {} component.\n\n".format( ex.appletName )
+                    + ex.message + "\n\n" )
+
+            QMessageBox.warning( self, "Can't use dataset", msg )
+            return_val[0] = False
+        else:
+            msg = ( "Can't use default properties for dataset:\n\n"
+                    + filename + "\n\n"
+                    + "because it violates a constraint of the {} component.\n\n".format( ex.appletName )
+                    + ex.message + "\n\n"
+                    + "If possible, fix this problem by adjusting the dataset properties in the next window, or hit 'cancel' to abort." )
+            
+            QMessageBox.warning( self, "Dataset Needs Correction", msg )
         
-        # The success of this is 'returned' via our special out-param
-        # (We can't return a value from this func because it is @threadRouted.
-        successfully_repaired = self.repairDatasetInfo( info, roleIndex, laneIndex )
-        return_val[0] = successfully_repaired
+            # The success of this is 'returned' via our special out-param
+            # (We can't return a value from this func because it is @threadRouted.
+            successfully_repaired = self.repairDatasetInfo( info, roleIndex, laneIndex )
+            return_val[0] = successfully_repaired
 
     def repairDatasetInfo(self, info, roleIndex, laneIndex):
         """Open the dataset properties editor and return True if the new properties are acceptable."""
@@ -806,15 +817,17 @@ class DataSelectionGui(QWidget):
                                  not model.hasInternalPaths())
     
     def addDvidVolume(self, roleIndex, laneIndex):
-        # TODO: Provide list of recently used dvid hosts, loaded from user preferences
         recent_hosts_pref = PreferencesManager.Setting("DataSelection", "Recent DVID Hosts")
         recent_hosts = recent_hosts_pref.get()
         if not recent_hosts:
             recent_hosts = ["localhost:8000"]
-        recent_hosts = filter(lambda h: h, recent_hosts)
+        recent_hosts = filter(lambda h: h, recent_hosts) # There used to be a bug where empty strings could be saved. Filter those out.
+
+        recent_nodes_pref = PreferencesManager.Setting("DataSelection", "Recent DVID Nodes")
+        recent_nodes = recent_nodes_pref.get() or {}
             
         from dvidDataSelectionBrowser import DvidDataSelectionBrowser
-        browser = DvidDataSelectionBrowser(recent_hosts, parent=self)
+        browser = DvidDataSelectionBrowser(recent_hosts, recent_nodes, parent=self)
         if browser.exec_() == DvidDataSelectionBrowser.Rejected:
             return
 
@@ -823,13 +836,13 @@ class DataSelectionGui(QWidget):
             return
 
         rois = None
-        hostname, dset_uuid, volume_name, uuid = browser.get_selection()
-        dvid_url = 'http://{hostname}/api/node/{uuid}/{volume_name}'.format( **locals() )
+        hostname, repo_uuid, volume_name, node_uuid, typename = browser.get_selection()
+        dvid_url = 'http://{hostname}/api/node/{node_uuid}/{volume_name}'.format( **locals() )
         subvolume_roi = browser.get_subvolume_roi()
 
         # Relocate host to top of 'recent' list, and limit list to 10 items.
         try:
-            i = recent_hosts.index(recent_hosts)
+            i = recent_hosts.index(hostname)
             del recent_hosts[i]
         except ValueError:
             pass
@@ -839,22 +852,12 @@ class DataSelectionGui(QWidget):
 
         # Save pref
         recent_hosts_pref.set(recent_hosts)
+        
+        recent_nodes[hostname] = node_uuid
+        recent_nodes_pref.set(recent_nodes)
 
         if subvolume_roi is None:
             self.addFileNames([dvid_url], roleIndex, laneIndex)
         else:
-            # In ilastik, we display the dvid volume axes in C-order, despite the dvid convention of F-order
-            # Transpose the subvolume roi to match
-            # (see implementation of OpDvidVolume)
             start, stop = subvolume_roi
-            start = tuple(reversed(start))
-            stop = tuple(reversed(stop))
             self.addFileNames([dvid_url], roleIndex, laneIndex, [(start, stop)])
-            
-
-
-
-
-
-
-

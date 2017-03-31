@@ -21,14 +21,16 @@
 # Built-in
 import os
 import logging
-import collections
+from collections import OrderedDict
 from functools import partial
 
 # Third-party
 import numpy
 from PyQt4 import uic
-from PyQt4.QtCore import Qt, pyqtSlot, QVariant
-from PyQt4.QtGui import QMessageBox, QColor, QIcon, QMenu, QDialog, QVBoxLayout, QDialogButtonBox, QListWidget, QListWidgetItem
+from PyQt4.QtCore import Qt, pyqtSlot, QVariant, pyqtRemoveInputHook, pyqtRestoreInputHook, QStringList, QString, QSize
+from PyQt4.QtGui import QMessageBox, QColor, QIcon, QMenu, QDialog, QVBoxLayout, QDialogButtonBox, QListWidget, \
+    QListWidgetItem, QApplication, QCursor, QAction, QComboBox, QTreeWidget, QTreeWidgetItem, QWidget, QSizePolicy, \
+    QPushButton, QLineEdit, QDialog
 
 # HCI
 from volumina.api import LazyflowSource, AlphaModulatedLayer, GrayscaleLayer, ColortableLayer
@@ -38,6 +40,7 @@ from lazyflow.utility import PathComponents
 from lazyflow.roi import slicing_to_string
 from lazyflow.operators.opReorderAxes import OpReorderAxes
 from lazyflow.operators.ioOperators import OpInputDataReader
+from lazyflow.operators import OpFeatureMatrixCache
 
 # ilastik
 from ilastik.config import cfg as ilastik_config
@@ -46,6 +49,10 @@ from ilastik.utility.gui import threadRouted
 from ilastik.shell.gui.iconMgr import ilastikIcons
 from ilastik.applets.labeling.labelingGui import LabelingGui
 from ilastik.applets.dataSelection.dataSelectionGui import DataSelectionGui, H5VolumeSelectionDlg
+from ilastik.shell.gui.variableImportanceDialog import VariableImportanceDialog
+
+# import IPython
+from FeatureSelectionDialog import FeatureSelectionDialog
 
 try:
     from volumina.view3d.volumeRendering import RenderingManager
@@ -71,8 +78,8 @@ class ClassifierSelectionDlg(QDialog):
         classifier_listwidget = QListWidget(parent=self)
         classifier_listwidget.setSelectionMode( QListWidget.SingleSelection )
 
-        classifer_factories = self._get_available_classifier_factories()
-        for name, classifier_factory in classifer_factories.items():
+        classifier_factories = self._get_available_classifier_factories()
+        for name, classifier_factory in classifier_factories.items():
             item = QListWidgetItem( name )
             item.setData( Qt.UserRole, QVariant(classifier_factory) )
             classifier_listwidget.addItem(item)
@@ -97,7 +104,7 @@ class ClassifierSelectionDlg(QDialog):
         from lazyflow.classifiers import VigraRfLazyflowClassifierFactory, SklearnLazyflowClassifierFactory, \
                                          ParallelVigraRfLazyflowClassifierFactory, VigraRfPixelwiseClassifierFactory,\
                                          LazyflowVectorwiseClassifierFactoryABC, LazyflowPixelwiseClassifierFactoryABC
-        classifiers = collections.OrderedDict()
+        classifiers = OrderedDict()
         classifiers["Parallel Random Forest (VIGRA)"] = ParallelVigraRfLazyflowClassifierFactory(100)
         
         try:
@@ -121,7 +128,8 @@ class ClassifierSelectionDlg(QDialog):
             import warnings
             warnings.warn("Couldn't import sklearn. Scikit-learn classifiers not available.")
 
-        # Debug classifiers        
+        # Debug classifiers
+        classifiers["Parallel Random Forest with Variable Importance (VIGRA)"] = ParallelVigraRfLazyflowClassifierFactory(100, variable_importance_enabled=True)        
         classifiers["(debug) Single-threaded Random Forest (VIGRA)"] = VigraRfLazyflowClassifierFactory(100)
         classifiers["(debug) Pixelwise Random Forest (VIGRA)"] = VigraRfPixelwiseClassifierFactory(100)
         
@@ -135,7 +143,120 @@ class ClassifierSelectionDlg(QDialog):
 
         # Close the dlg
         super( ClassifierSelectionDlg, self ).accept()
+
+class BookmarksWindow(QDialog):
+    """
+    A simple UI for showing bookmarks and navigating to them.
+
+    FIXME: For now, this window is tied to a particular lane.
+           If your project has more than one lane, then each one
+           will have it's own bookmark window, which is kinda dumb.
+    """
+    def __init__(self, parent, topLevelOperatorView):
+        super(BookmarksWindow, self).__init__(parent)
+        self.setWindowTitle("Bookmarks")
+        self.topLevelOperatorView = topLevelOperatorView
+        self.bookmark_tree = QTreeWidget(self)
+        self.bookmark_tree.setHeaderLabels( ["Location", "Notes"] )
+        self.bookmark_tree.setSizePolicy( QSizePolicy.Preferred, QSizePolicy.Preferred )
+        self.bookmark_tree.setColumnWidth(0, 200)
+        self.bookmark_tree.setColumnWidth(1, 300)
+
+        self.note_edit = QLineEdit(self)
+        self.add_bookmark_button = QPushButton("Add Bookmark", self, clicked=self.add_bookmark)
+
+        geometry = self.geometry()
+        geometry.setSize( QSize(520, 520) )
+        self.setGeometry(geometry)
+        
+        layout = QVBoxLayout()
+        layout.addWidget(self.bookmark_tree)
+        layout.addWidget(self.note_edit)
+        layout.addWidget(self.add_bookmark_button)
+        self.setLayout(layout)
+
+        self._load_bookmarks()
+        
+        self.bookmark_tree.setContextMenuPolicy( Qt.CustomContextMenu )
+        self.bookmark_tree.customContextMenuRequested.connect( self.showContextMenu )
+        
+        self.bookmark_tree.itemDoubleClicked.connect(self._handle_doubleclick)
+
+    def _handle_doubleclick(self, item, col):
+        """
+        Navigate to the bookmark
+        """
+        data = item.data(0, Qt.UserRole).toPyObject()
+        if data is None:
+            return
+
+        (coord, notes) = data
+        axes = self.topLevelOperatorView.InputImages.meta.getAxisKeys()
+        axes = axes[:-1] # drop channel
+        axes = sorted(axes)
+        assert len(axes) == len(coord)
+        tagged_coord = dict(zip(axes, coord))
+        tagged_location = OrderedDict(zip('txyzc', (0,0,0,0,0)))
+        tagged_location.update(tagged_coord)
+        t = tagged_location.values()[0]
+        coord3d = tagged_location.values()[1:4]
+        
+        self.parent().editor.posModel.time = t
+        self.parent().editor.navCtrl.panSlicingViews( coord3d, [0,1,2] )
+        self.parent().editor.posModel.slicingPos = coord3d
+
+    def showContextMenu(self, pos):
+        item = self.bookmark_tree.itemAt(pos)
+        data = item.data(0, Qt.UserRole).toPyObject()
+        if data is None:
+            return
+        
+        def delete_bookmark():
+            (coord, notes) = data
+            bookmarks = list(self.topLevelOperatorView.Bookmarks.value)
+            i = bookmarks.index((coord, notes))
+            bookmarks.pop(i)
+            self.topLevelOperatorView.Bookmarks.setValue(bookmarks)
+            self._load_bookmarks()
+
+        menu = QMenu(parent=self)
+        menu.addAction( QAction("Delete", menu, triggered=delete_bookmark) )
+        globalPos = self.bookmark_tree.viewport().mapToGlobal( pos )
+        menu.exec_( globalPos )
+        #selection = menu.exec_( globalPos )
+        #if selection is removeLanesAction:
+        #    self.removeLanesRequested.emit( self._selectedLanes )
+
+    def add_bookmark(self):
+        coord_txyzc = self.parent().editor.posModel.slicingPos5D
+        tagged_coord_txyzc = dict( zip('txyzc', coord_txyzc) )
+        axes = self.topLevelOperatorView.InputImages.meta.getAxisKeys()
+        axes = axes[:-1] # drop channel
+        axes = sorted(axes)
+        coord = tuple(tagged_coord_txyzc[c] for c in axes)
+
+        notes = str(self.note_edit.text())
+        bookmarks = list(self.topLevelOperatorView.Bookmarks.value)
+        bookmarks.append((coord, notes))
+        self.topLevelOperatorView.Bookmarks.setValue(bookmarks)
+        
+        self._load_bookmarks()
     
+    def _load_bookmarks(self):
+        self.bookmark_tree.clear()
+        lane_index = self.topLevelOperatorView.current_view_index()
+        lane_nickname = self.topLevelOperatorView.InputImages.meta.nickname or "Lane {}".format(lane_index)
+        bookmarks = self.topLevelOperatorView.Bookmarks.value
+        group_item = QTreeWidgetItem( self.bookmark_tree, QStringList(lane_nickname) )
+
+        for coord, notes in bookmarks:
+            item = QTreeWidgetItem( group_item, QStringList() )
+            item.setText(0, str(coord))
+            item.setData(0, Qt.UserRole, (coord, notes))
+            item.setText(1, notes)
+
+        self.bookmark_tree.expandAll()
+
 class PixelClassificationGui(LabelingGui):
 
     ###########################################
@@ -157,103 +278,112 @@ class PixelClassificationGui(LabelingGui):
     def menus( self ):
         menus = super( PixelClassificationGui, self ).menus()
 
-        # For now classifier selection is only available in debug mode
-        if ilastik_config.getboolean('ilastik', 'debug'):
-            advanced_menu = QMenu("Advanced", parent=self)
-            
-            def handleClassifierAction():
-                dlg = ClassifierSelectionDlg(self.topLevelOperatorView, parent=self)
-                dlg.exec_()
-            
-            classifier_action = advanced_menu.addAction("Classifier...")
-            classifier_action.triggered.connect( handleClassifierAction )
-            
-            def handleImportLabelsAction():
-                # Find the directory of the most recently opened image file
-                mostRecentImageFile = PreferencesManager().get( 'DataSelection', 'recent image' )
-                if mostRecentImageFile is not None:
-                    defaultDirectory = os.path.split(mostRecentImageFile)[0]
-                else:
-                    defaultDirectory = os.path.expanduser('~')
-                fileNames = DataSelectionGui.getImageFileNamesToOpen(self, defaultDirectory)
-                fileNames = map(str, fileNames)
-                
-                # For now, we require a single hdf5 file
-                if len(fileNames) > 1:
-                    QMessageBox.critical(self, "Too many files", 
-                                         "Labels must be contained in a single hdf5 volume.")
-                    return
-                if len(fileNames) == 0:
-                    # user cancelled
-                    return
-                
-                file_path = fileNames[0]
-                internal_paths = DataSelectionGui.getPossibleInternalPaths(file_path)
-                if len(internal_paths) == 0:
-                    QMessageBox.critical(self, "No volumes in file", 
-                                         "Couldn't find a suitable dataset in your hdf5 file.")
-                    return
-                if len(internal_paths) == 1:
-                    internal_path = internal_paths[0]
-                else:
-                    dlg = H5VolumeSelectionDlg(internal_paths, self)
-                    if dlg.exec_() == QDialog.Rejected:
-                        return
-                    selected_index = dlg.combo.currentIndex()
-                    internal_path = str(internal_paths[selected_index])
-
-                path_components = PathComponents(file_path)
-                path_components.internalPath = str(internal_path)
-                
-                try:
-                    top_op = self.topLevelOperatorView
-                    opReader = OpInputDataReader(parent=top_op.parent)
-                    opReader.FilePath.setValue( path_components.totalPath() )
+        advanced_menu = QMenu("Advanced", parent=self)
                     
-                    # Reorder the axes
-                    op5 = OpReorderAxes(parent=top_op.parent)
-                    op5.AxisOrder.setValue( top_op.LabelInputs.meta.getAxisKeys() )
-                    op5.Input.connect( opReader.Output )
+        def handleClassifierAction():
+            dlg = ClassifierSelectionDlg(self.topLevelOperatorView, parent=self)
+            dlg.exec_()
+        
+        classifier_action = advanced_menu.addAction("Classifier...")
+        classifier_action.triggered.connect( handleClassifierAction )
+        
+        def showVarImpDlg():
+            varImpDlg = VariableImportanceDialog(self.topLevelOperatorView.Classifier.value.named_importances, parent=self)
+            varImpDlg.exec_()
+            
+        advanced_menu.addAction("Variable Importance Table").triggered.connect(showVarImpDlg)
+        
+        def handleImportLabelsAction():
+            # Find the directory of the most recently opened image file
+            mostRecentImageFile = PreferencesManager().get( 'DataSelection', 'recent image' )
+            if mostRecentImageFile is not None:
+                defaultDirectory = os.path.split(mostRecentImageFile)[0]
+            else:
+                defaultDirectory = os.path.expanduser('~')
+            fileNames = DataSelectionGui.getImageFileNamesToOpen(self, defaultDirectory)
+            fileNames = map(str, fileNames)
+            
+            # For now, we require a single hdf5 file
+            if len(fileNames) > 1:
+                QMessageBox.critical(self, "Too many files", 
+                                     "Labels must be contained in a single hdf5 volume.")
+                return
+            if len(fileNames) == 0:
+                # user cancelled
+                return
+            
+            file_path = fileNames[0]
+            internal_paths = DataSelectionGui.getPossibleInternalPaths(file_path)
+            if len(internal_paths) == 0:
+                QMessageBox.critical(self, "No volumes in file", 
+                                     "Couldn't find a suitable dataset in your hdf5 file.")
+                return
+            if len(internal_paths) == 1:
+                internal_path = internal_paths[0]
+            else:
+                dlg = H5VolumeSelectionDlg(internal_paths, self)
+                if dlg.exec_() == QDialog.Rejected:
+                    return
+                selected_index = dlg.combo.currentIndex()
+                internal_path = str(internal_paths[selected_index])
+
+            path_components = PathComponents(file_path)
+            path_components.internalPath = str(internal_path)
+            
+            try:
+                top_op = self.topLevelOperatorView
+                opReader = OpInputDataReader(parent=top_op.parent)
+                opReader.FilePath.setValue( path_components.totalPath() )
                 
-                    # Finally, import the labels
-                    top_op.importLabels( top_op.current_view_index(), op5.Output )
-                        
-                finally:
-                    op5.cleanUp()
-                    opReader.cleanUp()
-
-            def print_label_blocks(sorted_axis):
-                sorted_column = self.topLevelOperatorView.InputImages.meta.getAxisKeys().index(sorted_axis)
-                
-                input_shape = self.topLevelOperatorView.InputImages.meta.shape
-                label_block_slicings = self.topLevelOperatorView.NonzeroLabelBlocks.value
-
-                sorted_block_slicings = sorted(label_block_slicings, key=lambda s: s[sorted_column])
-
-                for slicing in sorted_block_slicings:
-                    # Omit channel
-                    order = "".join( self.topLevelOperatorView.InputImages.meta.getAxisKeys() )
-                    line = order[:-1].upper() + ": "
-                    line += slicing_to_string( slicing[:-1], input_shape )
-                    print line
-
-            labels_submenu = QMenu("Labels")
-            self.labels_submenu = labels_submenu # Must retain this reference or else it gets auto-deleted.
+                # Reorder the axes
+                op5 = OpReorderAxes(parent=top_op.parent)
+                op5.AxisOrder.setValue( top_op.LabelInputs.meta.getAxisKeys() )
+                op5.Input.connect( opReader.Output )
             
-            import_labels_action = labels_submenu.addAction("Import Labels...")
-            import_labels_action.triggered.connect( handleImportLabelsAction )
+                # Finally, import the labels
+                top_op.importLabels( top_op.current_view_index(), op5.Output )
+                    
+            finally:
+                op5.cleanUp()
+                opReader.cleanUp()
 
-            self.print_labels_submenu = QMenu("Print Label Blocks")
-            labels_submenu.addMenu(self.print_labels_submenu)
+        def print_label_blocks(sorted_axis):
+            sorted_column = self.topLevelOperatorView.InputImages.meta.getAxisKeys().index(sorted_axis)
             
-            for axis in self.topLevelOperatorView.InputImages.meta.getAxisKeys()[:-1]:
-                self.print_labels_submenu\
-                    .addAction("Sort by {}".format( axis.upper() ))\
-                    .triggered.connect( partial(print_label_blocks, axis) )
+            input_shape = self.topLevelOperatorView.InputImages.meta.shape
+            label_block_slicings = self.topLevelOperatorView.NonzeroLabelBlocks.value
 
-            advanced_menu.addMenu(labels_submenu)
-            
-            menus += [advanced_menu]
+            sorted_block_slicings = sorted(label_block_slicings, key=lambda s: s[sorted_column])
+
+            for slicing in sorted_block_slicings:
+                # Omit channel
+                order = "".join( self.topLevelOperatorView.InputImages.meta.getAxisKeys() )
+                line = order[:-1].upper() + ": "
+                line += slicing_to_string( slicing[:-1], input_shape )
+                print line
+
+        labels_submenu = QMenu("Labels")
+        self.labels_submenu = labels_submenu # Must retain this reference or else it gets auto-deleted.
+        
+        import_labels_action = labels_submenu.addAction("Import Labels...")
+        import_labels_action.triggered.connect( handleImportLabelsAction )
+
+        self.print_labels_submenu = QMenu("Print Label Blocks")
+        labels_submenu.addMenu(self.print_labels_submenu)
+        
+        for axis in self.topLevelOperatorView.InputImages.meta.getAxisKeys()[:-1]:
+            self.print_labels_submenu\
+                .addAction("Sort by {}".format( axis.upper() ))\
+                .triggered.connect( partial(print_label_blocks, axis) )
+
+        advanced_menu.addMenu(labels_submenu)
+        
+        if ilastik_config.getboolean('ilastik', 'debug'):
+            def showBookmarksWindow():
+                self._bookmarks_window.show()
+            advanced_menu.addAction("Bookmarks...").triggered.connect(showBookmarksWindow)
+
+        menus += [advanced_menu]
 
         return menus
 
@@ -269,7 +399,6 @@ class PixelClassificationGui(LabelingGui):
         labelSlots.labelEraserValue = topLevelOperatorView.opLabelPipeline.opLabelArray.eraser
         labelSlots.labelDelete = topLevelOperatorView.opLabelPipeline.DeleteLabel
         labelSlots.labelNames = topLevelOperatorView.LabelNames
-        labelSlots.labelsAllowed = topLevelOperatorView.LabelsAllowedFlags
 
         self.__cleanup_fns = []
 
@@ -295,10 +424,18 @@ class PixelClassificationGui(LabelingGui):
         self.labelingDrawerUi.liveUpdateButton.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.labelingDrawerUi.liveUpdateButton.toggled.connect( self.toggleInteractive )
 
+        self.initFeatSelDlg()
+        self.labelingDrawerUi.suggestFeaturesButton.clicked.connect(self.show_feature_selection_dialog)
+        self.featSelDlg.accepted.connect(self.update_features_from_dialog)
+        self.labelingDrawerUi.suggestFeaturesButton.setEnabled(False)
+
         self.topLevelOperatorView.LabelNames.notifyDirty( bind(self.handleLabelSelectionChange) )
         self.__cleanup_fns.append( partial( self.topLevelOperatorView.LabelNames.unregisterDirty, bind(self.handleLabelSelectionChange) ) )
         
         self._initShortcuts()
+
+        self._bookmarks_window = BookmarksWindow(self, self.topLevelOperatorView)
+
 
         # FIXME: We MUST NOT enable the render manager by default,
         #        since it will drastically slow down the app for large volumes.
@@ -324,6 +461,45 @@ class PixelClassificationGui(LabelingGui):
         # listen to freezePrediction changes
         self.topLevelOperatorView.FreezePredictions.notifyDirty( bind(FreezePredDirty) )
         self.__cleanup_fns.append( partial( self.topLevelOperatorView.FreezePredictions.unregisterDirty, bind(FreezePredDirty) ) )
+
+    def initFeatSelDlg(self):
+        if self.topLevelOperatorView.name=="OpPixelClassification":
+            thisOpFeatureSelection = self.topLevelOperatorView.parent.featureSelectionApplet.topLevelOperator.innerOperators[0]
+        elif self.topLevelOperatorView.name=="OpPixelClassification0":
+            thisOpFeatureSelection = self.topLevelOperatorView.parent.featureSelectionApplets[0].topLevelOperator.innerOperators[0]
+        elif self.topLevelOperatorView.name=="OpPixelClassification1":
+            thisOpFeatureSelection = self.topLevelOperatorView.parent.featureSelectionApplets[1].topLevelOperator.innerOperators[0]
+        elif self.topLevelOperatorView.name=="OpPixelClassification2":
+            thisOpFeatureSelection = self.topLevelOperatorView.parent.featureSelectionApplets[2].topLevelOperator.innerOperators[0]
+        elif self.topLevelOperatorView.name=="OpPixelClassification3":
+            thisOpFeatureSelection = self.topLevelOperatorView.parent.featureSelectionApplets[3].topLevelOperator.innerOperators[0]
+        else:
+            raise NotImplementedError
+
+        self.featSelDlg = FeatureSelectionDialog(thisOpFeatureSelection, self.topLevelOperatorView)
+
+    def show_feature_selection_dialog(self):
+        self.featSelDlg.exec_()
+
+
+    def update_features_from_dialog(self):
+        if self.topLevelOperatorView.name=="OpPixelClassification":
+            thisOpFeatureSelection = self.topLevelOperatorView.parent.featureSelectionApplet.topLevelOperator.innerOperators[0]
+        elif self.topLevelOperatorView.name=="OpPixelClassification0":
+            thisOpFeatureSelection = self.topLevelOperatorView.parent.featureSelectionApplets[0].topLevelOperator.innerOperators[0]
+        elif self.topLevelOperatorView.name=="OpPixelClassification1":
+            thisOpFeatureSelection = self.topLevelOperatorView.parent.featureSelectionApplets[1].topLevelOperator.innerOperators[0]
+        elif self.topLevelOperatorView.name=="OpPixelClassification2":
+            thisOpFeatureSelection = self.topLevelOperatorView.parent.featureSelectionApplets[2].topLevelOperator.innerOperators[0]
+        elif self.topLevelOperatorView.name=="OpPixelClassification3":
+            thisOpFeatureSelection = self.topLevelOperatorView.parent.featureSelectionApplets[3].topLevelOperator.innerOperators[0]
+        else:
+            raise NotImplementedError
+
+
+        thisOpFeatureSelection.SelectionMatrix.setValue(self.featSelDlg.selected_features_matrix)
+        thisOpFeatureSelection.SelectionMatrix.setDirty()
+        thisOpFeatureSelection.setupOutputs()
 
     def initViewerControlUi(self):
         localDir = os.path.split(__file__)[0]
@@ -381,7 +557,7 @@ class PixelClassificationGui(LabelingGui):
                 self._update_rendering()
 
         if self.render:
-            layer.contexts.append(('Toggle 3D rendering', callback))
+            layer.contexts.append( QAction('Toggle 3D rendering', None, triggered=callback) )
 
     def setupLayers(self):
         """
@@ -412,6 +588,15 @@ class PixelClassificationGui(LabelingGui):
                     projectionLayer.visible = False
                     projectionLayer.opacity = 1.0
                     layers.append(projectionLayer)
+
+        # Show the mask over everything except labels
+        maskSlot = self.topLevelOperatorView.PredictionMasks
+        if maskSlot.ready():
+            maskLayer = self._create_binary_mask_layer_from_slot( maskSlot )
+            maskLayer.name = "Mask"
+            maskLayer.visible = True
+            maskLayer.opacity = 1.0
+            layers.append( maskLayer )
 
         # Add the uncertainty estimate layer
         uncertaintySlot = self.topLevelOperatorView.UncertaintyEstimate
@@ -563,6 +748,7 @@ class PixelClassificationGui(LabelingGui):
             if not self.topLevelOperatorView.FeatureImages.ready() \
             or self.topLevelOperatorView.FeatureImages.meta.shape==None:
                 self.labelingDrawerUi.liveUpdateButton.setChecked(False)
+                self.labelingDrawerUi.suggestFeaturesButton.setEnabled(False)
                 mexBox=QMessageBox()
                 mexBox.setText("There are no features selected ")
                 mexBox.exec_()
@@ -571,16 +757,20 @@ class PixelClassificationGui(LabelingGui):
         # If we're changing modes, enable/disable our controls and other applets accordingly
         if self.interactiveModeActive != checked:
             if checked:
+                self.labelingDrawerUi.suggestFeaturesButton.setEnabled(False)
                 self.labelingDrawerUi.labelListView.allowDelete = False
                 self.labelingDrawerUi.AddLabelButton.setEnabled( False )
             else:
                 num_label_classes = self._labelControlUi.labelListModel.rowCount()
                 self.labelingDrawerUi.labelListView.allowDelete = ( num_label_classes > self.minLabelNumber )
                 self.labelingDrawerUi.AddLabelButton.setEnabled( ( num_label_classes < self.maxLabelNumber ) )
+                self.labelingDrawerUi.suggestFeaturesButton.setEnabled(True)
+
         self.interactiveModeActive = checked
 
         self.topLevelOperatorView.FreezePredictions.setValue( not checked )
         self.labelingDrawerUi.liveUpdateButton.setChecked(checked)
+        #self.labelingDrawerUi.suggestFeaturesButton.setEnabled(checked)
         # Auto-set the "show predictions" state according to what the user just clicked.
         if checked:
             self._viewerControlUi.checkShowPredictions.setChecked( True )
@@ -657,6 +847,7 @@ class PixelClassificationGui(LabelingGui):
             self.handleShowSegmentationClicked()
 
         self.labelingDrawerUi.liveUpdateButton.setEnabled(enabled)
+        self.labelingDrawerUi.suggestFeaturesButton.setEnabled(enabled)
         self._viewerControlUi.checkShowPredictions.setEnabled(enabled)
         self._viewerControlUi.checkShowSegmentation.setEnabled(enabled)
 

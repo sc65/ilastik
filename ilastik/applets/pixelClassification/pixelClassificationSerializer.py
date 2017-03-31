@@ -19,7 +19,8 @@
 #		   http://ilastik.org/license.html
 ###############################################################################
 import numpy
-from ilastik.applets.base.appletSerializer import AppletSerializer, SerialClassifierSlot, SerialBlockSlot, SerialListSlot, SerialClassifierFactorySlot
+import vigra
+from ilastik.applets.base.appletSerializer import AppletSerializer, SerialClassifierSlot, SerialBlockSlot, SerialListSlot, SerialClassifierFactorySlot, SerialPickledValueSlot
 
 import logging
 logger = logging.getLogger(__name__) 
@@ -37,6 +38,7 @@ class PixelClassificationSerializer(AppletSerializer):
                                 transform=str),
                  SerialListSlot(operator.LabelColors, transform=lambda x: tuple(x.flat)),
                  SerialListSlot(operator.PmapColors, transform=lambda x: tuple(x.flat)),
+                 SerialPickledValueSlot(operator.Bookmarks),
                  SerialBlockSlot(operator.LabelImages,
                                  operator.LabelInputs,
                                  operator.NonzeroLabelBlocks,
@@ -57,7 +59,8 @@ class PixelClassificationSerializer(AppletSerializer):
         """
         # If this is an old project file that didn't save the label names to the project,
         #   create some default names.
-        if not self.operator.LabelNames.ready() or len(self.operator.LabelNames.value) == 0:
+        if (not self.operator.LabelNames.ready() or len(self.operator.LabelNames.value) == 0)\
+        and 'LabelSets' in topGroup:
             # How many labels are there?
             # We have to count them.  
             # This is slow, but okay for this special backwards-compatibilty scenario.
@@ -68,7 +71,7 @@ class PixelClassificationSerializer(AppletSerializer):
                 # For each label block
                 for block in group.values():
                     data = block[:]
-                    all_labels.update( numpy.unique(data) )
+                    all_labels.update( vigra.analysis.unique(data) )
 
             if all_labels:
                 max_label = max(all_labels)

@@ -18,6 +18,7 @@
 # on the ilastik web site at:
 #		   http://ilastik.org/license.html
 ###############################################################################
+from __future__ import division
 # Standard
 from Queue import Queue
 import re
@@ -34,11 +35,11 @@ import numpy
 
 # PyQt
 from PyQt4 import uic
-from PyQt4.QtCore import pyqtSignal, QObject, Qt, QUrl
+from PyQt4.QtCore import pyqtSignal, QObject, Qt, QUrl, QTimer
 from PyQt4.QtGui import QMainWindow, QWidget, QMenu, QApplication, \
     QStackedWidget, qApp, QFileDialog, QKeySequence, QMessageBox, \
-    QProgressBar, QInputDialog, QIcon, QFont, QToolButton, \
-    QHBoxLayout, QSizePolicy, QDesktopServices, QLabel
+    QProgressBar, QInputDialog, QIcon, QFont, QToolButton, QVBoxLayout, \
+    QHBoxLayout, QSizePolicy, QDesktopServices, QLabel, QDialog, QSpinBox, QDialogButtonBox
 
 # lazyflow
 from ilastik.widgets.ipcserver.tcpServerInfoWidget import TCPServerInfoWidget
@@ -47,7 +48,8 @@ from lazyflow.roi import TinyVector
 from lazyflow.graph import Operator
 import lazyflow.tools.schematic
 from lazyflow.operators.cacheMemoryManager import CacheMemoryManager
-from lazyflow.utility import timeLogged
+from lazyflow.utility import timeLogged, isUrl
+from lazyflow.request import Request
 
 # volumina
 from volumina.utility import PreferencesManager, ShortcutManagerDlg, ShortcutManager, decode_to_qstring, \
@@ -66,6 +68,7 @@ from iconMgr import ilastikIcons
 from ilastik.shell.gui.errorMessageFilter import ErrorMessageFilter
 from ilastik.shell.gui.memUsageDialog import MemUsageDialog
 from ilastik.shell.shellAbc import ShellABC
+from ilastik.shell.headless.headlessShell import HeadlessShell
 
 from ilastik.shell.gui.splashScreen import showSplashScreen
 from ilastik.shell.gui.licenseDialog import LicenseDialog
@@ -78,6 +81,12 @@ import os
 
 # Import all known workflows now to make sure they are all registered with getWorkflowFromName()
 import ilastik.workflows
+
+try:
+    import libdvid
+    _has_dvid_support = True
+except:
+    _has_dvid_support = False
 
 ILASTIKFont = QFont("Helvetica", 12, QFont.Bold)
 
@@ -129,7 +138,7 @@ class MemoryWidget(QWidget):
         self.setMemoryBytes(0)
 
     def setMemoryBytes(self, bytes):
-        self.label.setText("cached: %1.1f MB" % (bytes / (1024.0 ** 2.0)))
+        self.label.setText("Cached Data: %1.1f MB" % (bytes / (1024.0 ** 2.0)))
 
 
 #===----------------------------------------------------------------------------------------------------------------===
@@ -158,6 +167,17 @@ class ProgressDisplayManager(QObject):
         self.statusBar.addWidget(self.progressBar)
         self.progressBar.setHidden(True)
 
+        self.requestStatus = QLabel()
+        self.requestTimer = QTimer()
+        self.requestTimer.setInterval(1000)
+        def update_request_count():
+            msg = "Active Requests: {}".format( Request.active_count )
+            self.requestStatus.setText(msg)
+        self.requestTimer.timeout.connect( update_request_count )
+        self.requestTimer.start()
+
+        self.statusBar.addPermanentWidget(self.requestStatus)
+        
         self.memoryWidget = MemoryWidget()
         self.memoryWidget.showDialogButton.clicked.connect(self.parent().showMemUsageDialog)
         self.statusBar.addPermanentWidget(self.memoryWidget)
@@ -227,7 +247,7 @@ class ProgressDisplayManager(QObject):
 
         numActive = len(self.appletPercentages)
         if numActive > 0:
-            totalPercentage = numpy.sum(self.appletPercentages.values()) / numActive
+            totalPercentage = numpy.sum(self.appletPercentages.values()) // numActive
 
         # If any applet gave -1, put progress bar in "busy indicator" mode
         if (TinyVector(self.appletPercentages.values()) == -1).any():
@@ -259,6 +279,7 @@ class IlastikShell(QMainWindow):
     """
     The GUI's main window.  Simply a standard 'container' GUI for one or more applets.
     """
+    currentAppletChanged = pyqtSignal(int, int) # prev, current
 
     def __init__(self, parent=None, workflow_cmdline_args=None, flags=Qt.WindowFlags(0)):
         QMainWindow.__init__(self, parent=parent, flags=flags)
@@ -363,7 +384,7 @@ class IlastikShell(QMainWindow):
 
         self.currentAppletIndex = 0
 
-        self.currentImageIndex = -1
+        self._currentImageIndex = -1
         self.populatingImageSelectionCombo = False
         self.imageSelectionCombo.currentIndexChanged.connect(self.changeCurrentInputImageIndex)
 
@@ -495,6 +516,12 @@ class IlastikShell(QMainWindow):
         shellActions.importProjectAction.setIcon(QIcon(ilastikIcons.Open))
         shellActions.importProjectAction.triggered.connect(self.onImportProjectActionTriggered)
 
+        # Menu item: Download from DVID
+        if _has_dvid_support:
+            shellActions.downloadProjectFromDvidAction = menu.addAction("&Download Project from DVID...")
+            shellActions.downloadProjectFromDvidAction.setIcon(QIcon(ilastikIcons.Open))
+            shellActions.downloadProjectFromDvidAction.triggered.connect(self.onDownloadProjectFromDvidActionTriggered)    
+
         shellActions.closeAction = menu.addAction("&Close")
         shellActions.closeAction.setIcon(QIcon(ilastikIcons.ProcessStop))
         shellActions.closeAction.setShortcuts(QKeySequence.Close)
@@ -594,6 +621,8 @@ class IlastikShell(QMainWindow):
         menu.addAction("&Memory usage").triggered.connect(self.showMemUsageDialog)
         menu.addMenu(self._createProfilingSubmenu())
 
+        menu.addMenu(self._createAllocationTrackingSubmenu())
+
         menu.addAction("Show IPC Server Info", IPCFacade().show_info)
 
         def hideApplets(hideThem):
@@ -636,7 +665,6 @@ class IlastikShell(QMainWindow):
             assert not yappi.is_running()
 
             filename = 'ilastik_profile_sortedby_{}.txt'.format(sortby)
-
             recentPath = PreferencesManager().get('shell', 'recent sorted profile stats')
             if recentPath is None:
                 defaultPath = os.path.join(os.path.expanduser('~'), filename)
@@ -702,9 +730,11 @@ class IlastikShell(QMainWindow):
 
         startAction = profilingSubmenu.addAction("Start (reset)")
         startAction.triggered.connect(_startProfiling)
+        startAction.setIcon(QIcon(ilastikIcons.Record))
 
         stopAction = profilingSubmenu.addAction("Stop")
         stopAction.triggered.connect(_stopProfiling)
+        stopAction.setIcon(QIcon(ilastikIcons.Stop))
 
         sortedExportSubmenu = profilingSubmenu.addMenu("Save Sorted Stats...")
         for sortby in ['calls', 'cumulative', 'filename', 'pcalls', 'line', 'name', 'nfl', 'stdname', 'time']:
@@ -721,6 +751,105 @@ class IlastikShell(QMainWindow):
         # Must retain this reference, otherwise the menu gets automatically removed
         self._profilingSubmenu = profilingSubmenu
         return profilingSubmenu
+
+    def _createAllocationTrackingSubmenu(self):
+        self._allocation_threshold = PreferencesManager().get('shell', 'allocation tracking threshold')
+        if self._allocation_threshold is None:
+            self._allocation_threshold = 1000000 # 1 MB by default
+        
+        self._traceback_depth = PreferencesManager().get('shell', 'allocation tracking traceback depth')
+        if self._traceback_depth is None:
+            self._traceback_depth = 3 # default
+
+        # Must retain this reference, otherwise the menu gets automatically removed
+        allocationTrackingSubmenu = QMenu("Numpy Allocation Tracking")
+        self._allocationTrackingSubmenu = allocationTrackingSubmenu
+
+        try:
+            from numpy_allocation_tracking import PrettyAllocationTracker
+        except ImportError:
+            errMsgAction = allocationTrackingSubmenu.addAction("Not installed. Please try:"
+                                                               "  conda install -c ilastik numpy-allocation-tracking")
+            errMsgAction.setEnabled(False)
+            return allocationTrackingSubmenu
+
+        def _configureSettings():
+            dlg = QDialog(windowTitle="Allocation Tracking Settings")
+
+            threshold_box = QSpinBox(minimum=1, maximum=1000000000, suffix=' bytes')
+            threshold_box.setValue(self._allocation_threshold)
+
+            threshold_layout = QHBoxLayout()
+            threshold_layout.addWidget(QLabel("Allocation Threshold"))
+            threshold_layout.addWidget(threshold_box)
+
+            traceback_depth_box = QSpinBox(minimum=1, maximum=100, suffix=' frames')
+            traceback_depth_box.setValue(self._traceback_depth)
+
+            traceback_layout = QHBoxLayout()
+            traceback_layout.addWidget(QLabel("Displayed Stack Frames"))
+            traceback_layout.addWidget(traceback_depth_box)
+
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect( dlg.accept )
+            buttons.rejected.connect( dlg.reject )
+
+            layout = QVBoxLayout()
+            layout.addLayout(threshold_layout)
+            layout.addLayout(traceback_layout)
+            layout.addWidget( buttons )
+
+            dlg.setLayout(layout)
+            if dlg.exec_() == QDialog.Accepted:
+                self._allocation_threshold = threshold_box.value()
+                PreferencesManager().set('shell', 'allocation tracking threshold', self._allocation_threshold)
+
+                self._traceback_depth = traceback_depth_box.value()
+                PreferencesManager().set('shell', 'allocation tracking traceback depth', self._traceback_depth)
+
+        def _startAllocationTracking():
+            self._allocation_tracker = PrettyAllocationTracker(self._allocation_threshold, self._traceback_depth)
+            self._allocation_tracker.__enter__()
+            startAction.setEnabled(False)
+            stopAction.setEnabled(True)
+
+        def _stopAllocationTracking():
+            self._allocation_tracker.__exit__(None, None, None)
+            startAction.setEnabled(True)
+            stopAction.setEnabled(False)
+
+            filename = 'ilastik-tracked-numpy-allocations.html'
+            recentPath = PreferencesManager().get('shell', 'allocation tracking output html')
+            if recentPath is None:
+                defaultPath = os.path.join(os.path.expanduser('~'), filename)
+            else:
+                defaultPath = os.path.join(os.path.split(recentPath)[0], filename)
+            
+            htmlPath = QFileDialog.getSaveFileName(
+                self, "Export allocation tracking table", defaultPath, "HTML files (*.html)",
+                options=QFileDialog.Options(QFileDialog.DontUseNativeDialog))
+
+            if not htmlPath.isNull():
+                html_path = encode_from_qstring(htmlPath)
+                PreferencesManager().set('shell', 'allocation tracking output html', html_path)
+                self._allocation_tracker.write_html(html_path)
+
+                # As a convenience, go ahead and open it.
+                QDesktopServices.openUrl(QUrl.fromLocalFile(html_path))
+        
+        startAction = allocationTrackingSubmenu.addAction("Start")
+        startAction.triggered.connect(_startAllocationTracking)
+        startAction.setIcon(QIcon(ilastikIcons.Record))
+
+        stopAction = allocationTrackingSubmenu.addAction("Stop")
+        stopAction.triggered.connect(_stopAllocationTracking)
+        stopAction.setEnabled(False)
+        stopAction.setIcon(QIcon(ilastikIcons.Stop))
+
+        configureAction = allocationTrackingSubmenu.addAction("Configure...")
+        configureAction.triggered.connect(_configureSettings)
+        
+        return allocationTrackingSubmenu
 
     def showMemUsageDialog(self):
         if self._memDlg is None:
@@ -886,7 +1015,7 @@ class IlastikShell(QMainWindow):
                 else:
                     self._applets[i].getMultiLaneGui().setImageIndex(newImageIndex)
 
-            self.currentImageIndex = newImageIndex
+            self._currentImageIndex = newImageIndex
 
             if self.currentImageIndex != -1:
                 # Force the applet drawer to be redrawn
@@ -897,6 +1026,10 @@ class IlastikShell(QMainWindow):
                     updatedDrawerTitle = app.name
                     self.appletBar.setItemText(applet_index, updatedDrawerTitle)
 
+    @property
+    def currentImageIndex(self):
+        return self._currentImageIndex
+    
     def handleAppletBarItemExpanded(self, modelIndex):
         """
         The user wants to view a different applet bar item.
@@ -912,7 +1045,11 @@ class IlastikShell(QMainWindow):
         if self._refreshDrawerRecursionGuard is False:
             assert threading.current_thread().name == "MainThread"
             self._refreshDrawerRecursionGuard = True
+            
+            prev_applet_index = self.currentAppletIndex
             self.currentAppletIndex = applet_index
+            self.currentAppletChanged.emit(prev_applet_index, self.currentAppletIndex)
+            
             # Collapse all drawers in the applet bar...
             # ...except for the newly selected item.
             drawerModelIndex = self.getModelIndexFromDrawerIndex(applet_index)
@@ -1181,6 +1318,49 @@ class IlastikShell(QMainWindow):
             self._loadProject(newProjectFile, newProjectFilePath, workflow_class=None, readOnly=False,
                               importFromPath=importedFilePath)
 
+    def onDownloadProjectFromDvidActionTriggered(self):
+        logger.debug("Download Project From DVID")
+        
+        recent_hosts_pref = PreferencesManager.Setting("DataSelection", "Recent DVID Hosts")
+        recent_hosts = recent_hosts_pref.get()
+        if not recent_hosts:
+            recent_hosts = ["localhost:8000"]
+        recent_hosts = filter(lambda h: h, recent_hosts) # There used to be a bug where empty strings could be saved. Filter those out.
+
+        recent_nodes_pref = PreferencesManager.Setting("DataSelection", "Recent DVID Nodes")
+        recent_nodes = recent_nodes_pref.get() or {}
+
+        # Ask for a selection.
+        from libdvid.gui import ContentsBrowser
+        browser = ContentsBrowser(recent_hosts, recent_nodes, mode='select_existing', selectable_type='keyvalue', parent=self)
+        if browser.exec_() == ContentsBrowser.Rejected:
+            return
+
+        if None in browser.get_selection():
+            QMessageBox.critical("Couldn't use your selection.")
+            return
+
+        hostname, repo_uuid, data_name, node_uuid, typename = browser.get_selection()
+        dvid_url = 'http://{hostname}/api/node/{node_uuid}/{data_name}'.format( **locals() )
+
+        # Relocate host to top of 'recent' list, and limit list to 10 items.
+        try:
+            i = recent_hosts.index(hostname)
+            del recent_hosts[i]
+        except ValueError:
+            pass
+        finally:
+            recent_hosts.insert(0, hostname)        
+            recent_hosts = recent_hosts[:10]
+
+        # Save pref
+        recent_nodes[str(hostname)] = str(node_uuid)
+        recent_nodes_pref.set(recent_nodes)
+        recent_hosts_pref.set(recent_hosts)
+
+        # Open
+        self.openProjectFile(dvid_url)
+
     def getProjectPathToOpen(self, defaultDirectory):
         """
         Return the path of the project the user wants to open (or None if he cancels).
@@ -1216,18 +1396,28 @@ class IlastikShell(QMainWindow):
 
             self.openProjectFile(projectFilePath)
 
-    def openProjectFile(self, projectFilePath):
+    def openProjectFile(self, projectFilePath, force_readonly=False):
+        """
+        Explicitly required by ShellABC
+        """
+        # If the user gives us a URL to a DVID key,
+        # then download the project file from dvid first.
+        # (So far, DVID is the only type of URL access we support for project files.)
+        if isUrl(projectFilePath):
+            projectFilePath = HeadlessShell.downloadProjectFromDvid(projectFilePath)
+            force_readonly=True
+
         try:
-            hdf5File, workflow_class, readOnly = ProjectManager.openProjectFile(projectFilePath)
+            hdf5File, workflow_class, readOnly = ProjectManager.openProjectFile(projectFilePath, force_readonly)
         except ProjectManager.ProjectVersionError, e:
             QMessageBox.warning(self, "Old Project",
                                 "Could not load old project file: " + projectFilePath + ".\nPlease try 'Import Project' instead.")
         except ProjectManager.FileMissingError:
             QMessageBox.warning(self, "Missing File", "Could not find project file: " + projectFilePath)
         except:
-            msg = "Corrupted Project", "Unable to open project file: " + projectFilePath
+            msg = "Unable to open project file: " + projectFilePath
             log_exception(logger, msg)
-            QMessageBox.warning(self, msg)
+            QMessageBox.warning(self, "Corrupted Project", msg)
         else:
             #as load project can take a while, show a wait cursor
             QApplication.setOverrideCursor(Qt.WaitCursor)

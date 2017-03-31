@@ -19,12 +19,13 @@
 #		   http://ilastik.org/license.html
 ###############################################################################
 #Python
+from __future__ import division
 from copy import copy, deepcopy
 import collections
 from functools import partial
 
 # SciPy
-import numpy as np
+import numpy
 import vigra.analysis
 
 #lazyflow
@@ -34,6 +35,7 @@ from lazyflow.stype import Opaque
 from lazyflow.rtype import List, SubRegion
 from lazyflow.roi import roiToSlice, sliceToRoi
 from lazyflow.operators import OpLabelVolume, OpCompressedCache, OpArrayCache
+from itertools import groupby, count
 
 import logging
 logger = logging.getLogger(__name__)
@@ -94,22 +96,22 @@ def make_bboxes(binary_bbox, margin):
 
     """
     # object and context
-    max_margin = np.max(margin).astype(np.float32)
-    scaled_margin = (max_margin / margin)
+    max_margin = numpy.max(margin).astype(numpy.float32)
+    scaled_margin = (max_margin // margin)
     if len(margin) > 2:
-        dt = vigra.filters.distanceTransform3D(np.asarray(binary_bbox, dtype=np.float32),
+        dt = vigra.filters.distanceTransform(numpy.asarray(binary_bbox, dtype=numpy.float32),
                                                background=True,
-                                               pixel_pitch=np.asarray(scaled_margin).astype(np.float64))
+                                               pixel_pitch=numpy.asarray(scaled_margin).astype(numpy.float64))
     else:
-        dt = vigra.filters.distanceTransform2D(np.asarray(binary_bbox.squeeze(), dtype=np.float32),
-                                               pixel_pitch=np.asarray(scaled_margin).astype(np.float64))
+        dt = vigra.filters.distanceTransform(numpy.asarray(binary_bbox.squeeze(), dtype=numpy.float32),
+                                               pixel_pitch=numpy.asarray(scaled_margin).astype(numpy.float64))
         dt = dt.reshape(dt.shape + (1,))
 
     assert dt.ndim == 3
-    passed = np.asarray(dt < max_margin).astype(np.bool)
+    passed = numpy.asarray(dt < max_margin).astype(numpy.bool)
 
     # context only
-    context = np.asarray(passed) - np.asarray(binary_bbox).astype(np.bool)
+    context = numpy.asarray(passed) - numpy.asarray(binary_bbox).astype(numpy.bool)
     return passed, context
 
 
@@ -155,7 +157,7 @@ class OpCachedRegionFeatures(Operator):
         taggedOutputShape = self.LabelImage.meta.getTaggedShape()
         taggedRawShape = self.RawImage.meta.getTaggedShape()
 
-        if not np.all(list(taggedOutputShape.get(k, 0) == taggedRawShape.get(k, 0)
+        if not numpy.all(list(taggedOutputShape.get(k, 0) == taggedRawShape.get(k, 0)
                            for k in "txyz")):
             raise DatasetConstraintError( "Object Extraction",
                                           "Raw Image and Label Image shapes do not match.\n"\
@@ -204,16 +206,18 @@ class OpAdaptTimeListRoi(Operator):
         taggedShape['t'] = 1
         timeIndex = taggedShape.keys().index('t')
 
-        result = {}
-        for t in roi:
-            start = [0] * len(taggedShape)
-            stop = taggedShape.values()
-            start[timeIndex] = t
-            stop[timeIndex] = t + 1
+        # Get time ranges with consecutive numbers
+        time_ranges = [list(g) for _, g in groupby(roi, key=lambda n, c=count(): n - next(c))]
 
+        result = {}             
+        for time_range in time_ranges:
+            start = [time_range[0]]
+            stop = [time_range[-1]+1]
+                  
             val = self.Input(start, stop).wait()
-            assert val.shape == (1,)
-            result[t] = val[0]
+      
+            for i, t in enumerate(time_range):
+                result[t] = val[i]
 
         return result
 
@@ -285,8 +289,8 @@ class OpObjectCenterImage(Operator):
                 a = b
                 T += 1
             time_index = self.BinaryImage.meta.axistags.index('t')
-            stop = np.asarray(self.BinaryImage.meta.shape, dtype=np.int)
-            start = np.zeros_like(stop)
+            stop = numpy.asarray(self.BinaryImage.meta.shape, dtype=numpy.int)
+            start = numpy.zeros_like(stop)
             stop[time_index] = T
             start[time_index] = t
             
@@ -306,6 +310,9 @@ class OpObjectExtraction(Operator):
     BinaryImage = InputSlot()
     BackgroundLabels = InputSlot(optional=True)
 
+    # Bypass cache (for headless mode)
+    BypassModeEnabled = InputSlot(value=False)
+    
     # which features to compute.
     # nested dictionary with format:
     # dict[plugin_name][feature_name][parameter_name] = parameter_value
@@ -324,9 +331,8 @@ class OpObjectExtraction(Operator):
                                            # has rtype=List, indexed by t.
                                            # For other workflows, output has rtype=ArrayLike, indexed by (t)
 
-    LabelInputHdf5 = InputSlot(optional=True)
-    LabelOutputHdf5 = OutputSlot()
     CleanLabelBlocks = OutputSlot()
+    LabelImageCacheInput = InputSlot()
 
     RegionFeaturesCacheInput = InputSlot(optional=True)
     RegionFeaturesCleanBlocks = OutputSlot()
@@ -347,15 +353,15 @@ class OpObjectExtraction(Operator):
         #TODO BinaryImage is not binary in some workflows, could be made more
         # efficient
         self._opLabelVolume = OpLabelVolume(parent=self)
-        self._opLabelVolume.name = "OpObjectExtraction._opLabelVolume"
+        self._opLabelVolume.name = "OpObjectExtraction._opLabelVolume"        
         self._opRegFeats = OpCachedRegionFeatures(parent=self)
         self._opRegFeatsAdaptOutput = OpAdaptTimeListRoi(parent=self)
         self._opObjectCenterImage = OpObjectCenterImage(parent=self)
 
         # connect internal operators
         self._opLabelVolume.Input.connect(self.BinaryImage)
-        self._opLabelVolume.InputHdf5.connect(self.LabelInputHdf5)
         self._opLabelVolume.Background.connect(self.BackgroundLabels)
+        self._opLabelVolume.BypassModeEnabled.connect(self.BypassModeEnabled)
 
         self._opRegFeats.RawImage.connect(self.RawImage)
         self._opRegFeats.LabelImage.connect(self._opLabelVolume.CachedOutput)
@@ -378,7 +384,6 @@ class OpObjectExtraction(Operator):
         self.ObjectCenterImage.connect(self._opCenterCache.Output)
         self.RegionFeatures.connect(self._opRegFeatsAdaptOutput.Output)
         self.BlockwiseRegionFeatures.connect(self._opRegFeats.Output)
-        self.LabelOutputHdf5.connect(self._opLabelVolume.OutputHdf5)
         self.CleanLabelBlocks.connect(self._opLabelVolume.CleanBlocks)
 
         # As soon as input data is available, check its constraints
@@ -401,6 +406,9 @@ class OpObjectExtraction(Operator):
             
 
     def setupOutputs(self):
+        # Setup LabelImageCacheInput for the serialization of the compressed cache
+        self._opLabelVolume._opLabel._cache.Input.connect(self.LabelImageCacheInput)
+                
         taggedShape = self.RawImage.meta.getTaggedShape()
         for k in taggedShape.keys():
             if k == 't' or k == 'c':
@@ -416,7 +424,8 @@ class OpObjectExtraction(Operator):
         pass
 
     def setInSlot(self, slot, subindex, roi, value):
-        assert slot == self.LabelInputHdf5 or slot == self.RegionFeaturesCacheInput, "Invalid slot for setInSlot(): {}".format(slot.name)
+        assert slot == self.RegionFeaturesCacheInput or \
+        slot == self.LabelImageCacheInput, "Invalid slot for setInSlot(): {}".format(slot.name)
         # Nothing to do here.
         # Our Input slots are directly fed into the cache,
         #  so all calls to __setitem__ are forwarded automatically
@@ -428,7 +437,7 @@ class OpObjectExtraction(Operator):
             object-level data to csv and h5 files. The columns of the table are as follows:
             (t, object index, feature 1, feature 2, ...). Row-wise object index increases
             faster than time, so first all objects for time 0 are exported, then for time 1, etc  '''
-       
+
         ntimes = len(features.keys())
         nplugins = len(features[0].keys())
         nchannels = 0
@@ -463,22 +472,22 @@ class OpObjectExtraction(Operator):
         # Convert to str.
         dtype_names = map(str, dtype_names)
         
-        dtype_types.insert(0, np.dtype(np.uint32).str)
-        dtype_types.insert(0, np.dtype(np.uint32).str)
+        dtype_types.insert(0, numpy.dtype(numpy.uint32).str)
+        dtype_types.insert(0, numpy.dtype(numpy.uint32).str)
         
         nobjects_total = sum(nobjects)
         
-        table = np.zeros(nobjects_total, dtype = {'names': dtype_names, 'formats': dtype_types})
+        table = numpy.zeros(nobjects_total, dtype = {'names': dtype_names, 'formats': dtype_types})
         
-        #table = np.zeros(4, dtype = {'names': ['Mean', 'Coord<Maximum>_ch_0'], \
-        #                           'formats': [np.dtype(np.uint32), np.dtype(np.uint8)]})
+        #table = numpy.zeros(4, dtype = {'names': ['Mean', 'Coord<Maximum>_ch_0'], \
+        #                           'formats': [numpy.dtype(numpy.uint32), numpy.dtype(numpy.uint8)]})
         
         
         start = 0
         finish = start
         for itime in range(ntimes):
             finish = start+nobjects[itime]
-            table["Object id"][start: finish] = np.arange(nobjects[itime])
+            table["Object id"][start: finish] = numpy.arange(nobjects[itime])
             table["Time"][start: finish] = itime
             nfeat = 2
             for plugin_name, plugins in features[itime].iteritems():
@@ -527,7 +536,7 @@ class OpRegionFeatures(Operator):
         taggedOutputShape = self.LabelVolume.meta.getTaggedShape()
         taggedRawShape = self.RawVolume.meta.getTaggedShape()
 
-        if not np.all(list(taggedOutputShape.get(k, 0) == taggedRawShape.get(k, 0)
+        if not numpy.all(list(taggedOutputShape.get(k, 0) == taggedRawShape.get(k, 0)
                            for k in "txyz")):
             raise Exception("shapes do not match. label volume shape: {}."
                             " raw data shape: {}".format(
@@ -616,6 +625,30 @@ class OpRegionFeatures(Operator):
         key.insert(axes.c, slice(None))
         return image[tuple(key)]
 
+    def _augmentFeatureNames(self, features):
+        # Take a dictionary of feature names, augment it by default features and set to Features() slot
+        
+        feature_names = features
+        feature_names_with_default = deepcopy(feature_names)
+
+        #expand the feature list by our default features
+        logger.debug("attaching default features {} to vigra features {}".format(default_features, feature_names))
+        plugin = pluginManager.getPluginByName("Standard Object Features", "ObjectFeatures")
+        all_default_props = plugin.plugin_object.fill_properties(default_features) #fill in display name and such
+        feature_names_with_default[default_features_key] = all_default_props
+
+        if not "Standard Object Features" in feature_names.keys():
+            # The user has not selected any standard features. Add them now
+            feature_names_with_default["Standard Object Features"] = {}
+
+        for default_feature_name, default_feature_props in default_features.iteritems():
+            if default_feature_name not in feature_names_with_default["Standard Object Features"]:
+                # this feature has not been selected by the user, add it now.
+                feature_names_with_default["Standard Object Features"][default_feature_name] = all_default_props[default_feature_name]
+                feature_names_with_default["Standard Object Features"][default_feature_name]["selected"] = False
+
+        return feature_names_with_default
+
     def _extract(self, image, labels):
         if not (image.ndim == labels.ndim == 4):
             raise Exception("both images must be 4D. raw image shape: {}"
@@ -636,45 +669,35 @@ class OpRegionFeatures(Operator):
         
         logger.debug("Computing default features")
 
+        #These are the feature names, selected by the user and the default feature names.
         feature_names = deepcopy(self.Features([]).wait())
+        feature_names = self._augmentFeatureNames(feature_names)
 
         # do global features
         logger.debug("computing global features")
-        extra_features_computed = False
         global_features = {}
-        selected_vigra_features = []
         for plugin_name, feature_dict in feature_names.iteritems():
+            if plugin_name == default_features_key:
+                continue
             plugin = pluginManager.getPluginByName(plugin_name, "ObjectFeatures")
-            if plugin_name == "Standard Object Features":
-                #expand the feature list by our default features
-                logger.debug("attaching default features {} to vigra features {}".format(default_features, feature_dict))
-                selected_vigra_features = feature_dict.keys()
-                feature_dict.update(default_features)
-                extra_features_computed = True
             global_features[plugin_name] = plugin.plugin_object.compute_global(image, labels, feature_dict, axes)
         
         extrafeats = {}
-        if extra_features_computed:
-            for feat_key in default_features:
-                feature = None
-                if feat_key in selected_vigra_features:
-                    #we wanted that feature independently
-                    feature = global_features["Standard Object Features"][feat_key]
-                else:
-                    feature = global_features["Standard Object Features"].pop(feat_key)
-                    feature_names["Standard Object Features"].pop(feat_key)
-                extrafeats[feat_key] = feature
-        else:
-            logger.debug("default features not computed, computing separately")
-            extrafeats_acc = vigra.analysis.extractRegionFeatures(image[slc3d].squeeze().astype(np.float32), labels.squeeze(),
-                                                        default_features.keys(),
-                                                        ignoreLabel=0)
-            #remove the 0th object, we'll add it again later
-            for k, v in extrafeats_acc.iteritems():
-                extrafeats[k]=v[1:]
-                if len(v.shape)==1:
-                    extrafeats[k]=extrafeats[k].reshape(extrafeats[k].shape+(1,))
-        
+        for feat_key in default_features:
+            try:
+                sel = feature_names["Standard Object Features"][feat_key]["selected"]
+            except KeyError:
+                # we don't always set this property to True, sometimes it's just not there. The only important
+                # thing is that it's not False
+                sel = True
+            if not sel:
+                # This feature has not been selected by the user. Remove it from the computed dict into a special dict
+                # for default features
+                feature = global_features["Standard Object Features"].pop(feat_key)
+            else:
+                feature = global_features["Standard Object Features"][feat_key]
+            extrafeats[feat_key] = feature
+
         extrafeats = dict((k.replace(' ', ''), v)
                           for k, v in extrafeats.iteritems())
         
@@ -700,14 +723,14 @@ class OpRegionFeatures(Operator):
                     break
             
                             
-        if np.any(margin) > 0:
+        if numpy.any(margin) > 0:
             #starting from 0, we stripped 0th background object in global computation
             for i in range(0, nobj):
                 logger.debug("processing object {}".format(i))
                 extent = self.compute_extent(i, image, mincoords, maxcoords, axes, margin)
                 rawbbox = self.compute_rawbbox(image, extent, axes)
                 #it's i+1 here, because the background has label 0
-                binary_bbox = np.where(labels[tuple(extent)] == i+1, 1, 0).astype(np.bool)
+                binary_bbox = numpy.where(labels[tuple(extent)] == i+1, 1, 0).astype(numpy.bool)
                 for plugin_name, feature_dict in feature_names.iteritems():
                     if not has_local_features[plugin_name]:
                         continue
@@ -721,7 +744,7 @@ class OpRegionFeatures(Operator):
             for key in pfeats.keys():
                 value = pfeats[key]
                 try:
-                    pfeats[key] = np.vstack(list(v.reshape(1, -1) for v in value))
+                    pfeats[key] = numpy.vstack(list(v.reshape(1, -1) for v in value))
                 except:
                     logger.warn('feature {} failed'.format(key))
                     del pfeats[key]
@@ -744,11 +767,11 @@ class OpRegionFeatures(Operator):
 
                 # because object classification operator expects nobj to
                 # include background. FIXME: we should change that assumption.
-                value = np.vstack((np.zeros(value.shape[1]),
+                value = numpy.vstack((numpy.zeros(value.shape[1]),
                                    value))
-                value = value.astype(np.float32) #turn Nones into numpy.NaNs
+                value = value.astype(numpy.float32) #turn Nones into numpy.NaNs
 
-                assert value.dtype == np.float32
+                assert value.dtype == numpy.float32
                 assert value.shape[0] == nobj+1
                 assert value.ndim == 2
 

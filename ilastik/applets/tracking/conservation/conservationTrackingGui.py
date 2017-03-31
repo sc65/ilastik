@@ -6,6 +6,7 @@ import sys
 import re
 import traceback
 from PyQt4.QtCore import pyqtSignal
+from volumina.utility import encode_from_qstring
 from ilastik.applets.tracking.base.trackingBaseGui import TrackingBaseGui
 from ilastik.utility import log_exception
 from ilastik.utility.exportingOperator import ExportingGui
@@ -14,23 +15,59 @@ from ilastik.utility.gui.titledMenu import TitledMenu
 from ilastik.utility.ipcProtocol import Protocol
 from ilastik.shell.gui.ipcManager import IPCFacade
 from ilastik.config import cfg as ilastik_config
+from ilastik.plugins import pluginManager
+
 
 from lazyflow.request.request import Request
 
 logger = logging.getLogger(__name__)
 traceLogger = logging.getLogger('TRACE.' + __name__)
 
+try:
+    import hytra
+    WITH_HYTRA = True
+except ImportError as e:
+    WITH_HYTRA = False
+
+if WITH_HYTRA:
+    # Import solvers for HyTra
+    import dpct
+    try:
+        import multiHypoTracking_with_cplex as mht
+    except ImportError:
+        try:
+            import multiHypoTracking_with_gurobi as mht
+        except ImportError:
+            logger.warning("Could not find any ILP solver")
+else:
+    # Try to import pgmlink for backward compatibility with old pipeline        
+    try:
+        import pgmlink
+    except:
+        import pgmlinkNoIlpSolver as pgmlink
+
 class ConservationTrackingGui(TrackingBaseGui, ExportingGui):
     
     withMergers = True
     @threadRouted
-    def _setMergerLegend(self, labels, selection):   
-        for i in range(1,len(labels)+1):
+    def _setMergerLegend(self, labels, selection):
+        param = self.topLevelOperatorView.Parameters.value
+        if 'withMergerResolution' in param.keys():
+            if param['withMergerResolution']:
+                selection = 1
+        elif self._drawer.mergerResolutionBox.isChecked():
+            selection = 1
+
+        for i in range(2,len(labels)+1):
             if i <= selection:
                 labels[i-1].setVisible(True)
             else:
                 labels[i-1].setVisible(False)
-    
+
+        # hide merger legend if selection < 2
+        self._drawer.label_4.setVisible(selection > 1)
+        labels[0].setVisible(selection > 1)
+
     def _loadUiFile(self):
         # Load the ui file (find it in our own directory)
         localDir = os.path.split(__file__)[0]
@@ -69,24 +106,80 @@ class ConservationTrackingGui(TrackingBaseGui, ExportingGui):
             self._drawer.appearanceBox.setValue(parameters['appearanceCost'])
         if 'disappearanceCost' in parameters.keys():
             self._drawer.disappearanceBox.setValue(parameters['disappearanceCost'])
+        if 'max_nearest_neighbors' in parameters.keys():
+            self._drawer.maxNearestNeighborsSpinBox.setValue(parameters['max_nearest_neighbors'])
+        if 'numFramesPerSplit' in parameters.keys():
+            self._drawer.numFramesPerSplitSpinBox.setValue(parameters['numFramesPerSplit'])
+        
+
+        # solver: use stored value only if that solver is available
+        self._drawer.solverComboBox.clear()
+        availableSolvers = self.getAvailableTrackingSolverTypes()
+        self._drawer.solverComboBox.addItems(availableSolvers)
+        if 'solver' in parameters.keys() and parameters['solver'] in availableSolvers:
+            self._drawer.solverComboBox.setCurrentIndex(availableSolvers.index(parameters['solver']))
+
+        # Hide division GUI widgets
+        if 'withAnimalTracking' in parameters.keys() and parameters['withAnimalTracking'] == True:
+            self._drawer.divisionsBox.hide()
+            self._drawer.divWeightBox.hide()
+            self._drawer.label_6.hide()       
         
         return self._drawer
 
+    @staticmethod
+    def getAvailableTrackingSolverTypes():
+        solvers = []
+        if WITH_HYTRA:
+            try:
+                if dpct:
+                    solvers.append('Flow-based')
+            except Exception as e:
+                logger.info(str(e))
+                
+            try:
+                if mht:
+                    solvers.append('ILP')
+            except Exception as e:
+                logger.info(str(e))
+                
+        else:
+            if hasattr(pgmlink.ConsTrackingSolverType, "CplexSolver"):
+                solvers.append("ILP")
+    
+            if hasattr(pgmlink.ConsTrackingSolverType, "DynProgSolver"):
+                solvers.append("Magnusson")
+    
+            if hasattr(pgmlink.ConsTrackingSolverType, "FlowSolver"):
+                solvers.append("Flow-based")
+        return solvers
+
     def initAppletDrawerUi(self):
-        super(ConservationTrackingGui, self).initAppletDrawerUi()        
+        super(ConservationTrackingGui, self).initAppletDrawerUi()
 
         self._allowedTimeoutInputRegEx = re.compile('^[0-9]*$')
         self._drawer.timeoutBox.textChanged.connect(self._onTimeoutBoxChanged)
 
         if not ilastik_config.getboolean("ilastik", "debug"):
-            assert self._drawer.trackletsBox.isChecked()
-            self._drawer.trackletsBox.hide()
-            
-            assert not self._drawer.hardPriorBox.isChecked()
-            self._drawer.hardPriorBox.hide()
+            def checkboxAssertHandler(checkbox, assertEnabled=True):
+                if checkbox.isChecked() == assertEnabled:
+                    checkbox.hide()
+                else:
+                    checkbox.setEnabled(False)
 
-            assert not self._drawer.opticalBox.isChecked()
-            self._drawer.opticalBox.hide()
+            checkboxAssertHandler(self._drawer.trackletsBox, True)
+
+            if self._drawer.classifierPriorBox.isChecked():
+                self._drawer.hardPriorBox.hide()
+                self._drawer.classifierPriorBox.hide()
+                self._drawer.sizeDepBox.hide()
+            else:
+                self._drawer.hardPriorBox.setEnabled(False)
+                self._drawer.classifierPriorBox.setEnabled(False)
+                self._drawer.sizeDepBox.setEnabled(False)
+
+            checkboxAssertHandler(self._drawer.opticalBox, False)
+            checkboxAssertHandler(self._drawer.mergerResolutionBox, True)
 
             self._drawer.maxDistBox.hide() # hide the maximal distance box
             self._drawer.label_2.hide() # hie the maximal distance label
@@ -94,6 +187,8 @@ class ConservationTrackingGui(TrackingBaseGui, ExportingGui):
             self._drawer.divThreshBox.hide()
             self._drawer.label_25.hide() # hide avg. obj size label
             self._drawer.avgSizeBox.hide()
+            self._drawer.label_24.hide() # hide motion model weight label
+            self._drawer.motionModelWeightBox.hide()
           
         self.mergerLabels = [self._drawer.merg1,
                              self._drawer.merg2,
@@ -106,7 +201,11 @@ class ConservationTrackingGui(TrackingBaseGui, ExportingGui):
             self._labelSetStyleSheet(self.mergerLabels[i], self.mergerColors[i+1])
         
         self._onMaxObjectsBoxChanged()
-        self._drawer.maxObjectsBox.valueChanged.connect(self._onMaxObjectsBoxChanged)                
+        self._drawer.maxObjectsBox.valueChanged.connect(self._onMaxObjectsBoxChanged)
+        self._drawer.mergerResolutionBox.stateChanged.connect(self._onMaxObjectsBoxChanged)
+
+        if WITH_HYTRA:
+            self._drawer.exportButton.hide()
 
     @threadRouted
     def _onTimeoutBoxChanged(self, *args):
@@ -172,7 +271,10 @@ class ConservationTrackingGui(TrackingBaseGui, ExportingGui):
             withArmaCoordinates = True
             appearanceCost = self._drawer.appearanceBox.value()
             disappearanceCost = self._drawer.disappearanceBox.value()
-    
+
+            motionModelWeight = self._drawer.motionModelWeightBox.value()
+            solver = self._drawer.solverComboBox.currentText()
+
             ndim=3
             if (to_z - from_z == 0):
                 ndim=2
@@ -193,6 +295,7 @@ class ConservationTrackingGui(TrackingBaseGui, ExportingGui):
                     avgSize=avgSize,                
                     withTracklets=withTracklets,
                     sizeDependent=sizeDependent,
+                    detWeight=10.0,
                     divWeight=divWeight,
                     transWeight=transWeight,
                     withDivisions=withDivisions,
@@ -200,12 +303,18 @@ class ConservationTrackingGui(TrackingBaseGui, ExportingGui):
                     withClassifierPrior=classifierPrior,
                     ndim=ndim,
                     withMergerResolution=withMergerResolution,
-                    borderAwareWidth = borderAwareWidth,
-                    withArmaCoordinates = withArmaCoordinates,
-                    cplex_timeout = cplex_timeout,
-                    appearance_cost = appearanceCost,
-                    disappearance_cost = disappearanceCost
+                    borderAwareWidth =borderAwareWidth,
+                    withArmaCoordinates =withArmaCoordinates,
+                    cplex_timeout =cplex_timeout,
+                    appearance_cost =appearanceCost,
+                    disappearance_cost =disappearanceCost,
+                    motionModelWeight=motionModelWeight,
+                    force_build_hypotheses_graph =False,
+                    max_nearest_neighbors=self._drawer.maxNearestNeighborsSpinBox.value(),
+                    numFramesPerSplit=self._drawer.numFramesPerSplitSpinBox.value(),
+                    solverName=solver
                     )
+
             except Exception as ex:
                 log_exception(logger, "Error during tracking.  See above error traceback.")
                 self._criticalMessage("Error during tracking.  See error log.\n\n"
@@ -219,7 +328,12 @@ class ConservationTrackingGui(TrackingBaseGui, ExportingGui):
             self._drawer.TrackButton.setEnabled(True)
             self._drawer.exportButton.setEnabled(True)
             self._drawer.exportTifButton.setEnabled(True)
-            self._setLayerVisible("Objects", False) 
+            self._setLayerVisible("Objects", False)
+            
+            # update showing the merger legend,
+            # as it might be (no longer) needed if merger resolving
+            # is disabled(enabled)
+            self._setMergerLegend(self.mergerLabels, self._drawer.maxObjectsBox.value())
             
         def _handle_failure( exc, exc_info ):
             self.applet.busy = False
@@ -237,19 +351,33 @@ class ConservationTrackingGui(TrackingBaseGui, ExportingGui):
         req.submit()
 
     def menus(self):
+        menus = super( ConservationTrackingGui, self ).menus()
+        
         m = QtGui.QMenu("&Export", self.volumeEditorWidget)
         m.addAction("Export Tracking Information").triggered.connect(self.show_export_dialog)
 
-        return [m]
+        menus.append(m)
+
+        return menus
 
     def get_raw_shape(self):
         return self.topLevelOperatorView.RawImage.meta.shape
 
     def get_feature_names(self):
         params = self.topLevelOperatorView.Parameters
-        if params.value["withDivisions"] if params.ready() else False:
+        if params.ready() and params.value["withDivisions"]:
             return self.topLevelOperatorView.ComputedFeatureNamesWithDivFeatures([]).wait()
         return self.topLevelOperatorView.ComputedFeatureNames([]).wait()
+
+    def get_color(self, pos5d):
+        slicing = tuple(slice(i, i+1) for i in pos5d)
+        color = self.mainOperator.CachedOutput(slicing).wait()
+        return color.flat[0]
+
+    def get_object(self, pos5d):
+        slicing = tuple(slice(i, i+1) for i in pos5d)
+        label = self.mainOperator.RelabeledImage(slicing).wait()
+        return label.flat[0], pos5d[0]
 
     @property
     def gui_applet(self):
@@ -268,26 +396,46 @@ class ConservationTrackingGui(TrackingBaseGui, ExportingGui):
                 menu.addAction("Clear Hilite", IPCFacade().broadcast(Protocol.cmd("clear")))
             menu.exec_(win_coord)
             return
-
-        try:
-            color = self.mainOperator.label2color[time][obj]
-            tracks = [self.mainOperator.track_id[time][obj]]
-            extra = self.mainOperator.extra_track_ids
-        except (IndexError, KeyError):
-            color = None
-            tracks = []
-            extra = {}
-
-        if time in extra and obj in extra[time]:
-            tracks.extend(extra[time][obj])
-        if tracks:
-            children, parents = self.mainOperator.track_family(tracks[0])
+        
+        # Get color and track from hypotheses graph (which is a slot in the new operator)
+        # TODO: Remove pgmlink section after old operator is phased out
+        if WITH_HYTRA:
+            hypothesesGraph = self.mainOperator.HypothesesGraph.value
+    
+            if hypothesesGraph == None:
+                color = None
+                track = None
+            else:
+                color = hypothesesGraph.getLineageId(time, obj)
+                track = hypothesesGraph.getTrackId(time, obj)
         else:
-            children, parents = None, None
+            try:
+                extra = self.mainOperator.extra_track_ids
+            except (IndexError, KeyError):
+                extra = {}
+    
+            # if this is a resolved merger, find which of the merged IDs we actually clicked on
+            if time in extra and obj in extra[time]:
+                colors = [self.mainOperator.label2color[time][t] for t in extra[time][obj]]
+                tracks = [self.mainOperator.track_id[time][t] for t in extra[time][obj]]
+                selected_track = self.get_color(position5d)
+                idx = colors.index(selected_track)
+                color = colors[idx]
+                track = tracks[idx]
+            else:
+                try:
+                    color = self.mainOperator.label2color[time][obj]
+                    track = [self.mainOperator.track_id[time][obj]][0]
+                except (IndexError, KeyError):
+                    color = None
+                    track = []
+
+        children = None 
+        parents = None
 
         menu = TitledMenu([
             "Object {} of lineage id {}".format(obj, color),
-            "Track ids: " + (", ".join(map(str, set(tracks))) or "None"),
+            "Track id: " + (str(track) or "None"),
         ])
 
         if not debug:

@@ -23,7 +23,6 @@ from lazyflow.operators.opReorderAxes import OpReorderAxes
 
 from ilastik.workflow import Workflow
 
-from ilastik.applets.projectMetadata import ProjectMetadataApplet
 from ilastik.applets.dataSelection import DataSelectionApplet
 from ilastik.applets.featureSelection import FeatureSelectionApplet
 from ilastik.applets.pixelClassification import PixelClassificationApplet
@@ -38,7 +37,7 @@ if ilastik.config.cfg.getboolean('ilastik', 'debug'):
     class CarvingFromPixelPredictionsWorkflow(Workflow):
         
         workflowName = "Carving From Pixel Predictions"
-        defaultAppletIndex = 1 # show DataSelection by default
+        defaultAppletIndex = 0 # show DataSelection by default
         
         @property
         def applets(self):
@@ -62,7 +61,6 @@ if ilastik.config.cfg.getboolean('ilastik', 'debug'):
             super(CarvingFromPixelPredictionsWorkflow, self).__init__(shell, headless, workflow_cmdline_args, project_creation_args, *args, graph=graph, **kwargs)
             
             ## Create applets 
-            self.projectMetadataApplet = ProjectMetadataApplet()
             self.dataSelectionApplet = DataSelectionApplet(self, "Input Data", "Input Data", supportIlastik05Import=True, batchDataGui=False)
             opDataSelection = self.dataSelectionApplet.topLevelOperator
             opDataSelection.DatasetRoles.setValue( ['Raw Data'] )
@@ -83,7 +81,6 @@ if ilastik.config.cfg.getboolean('ilastik', 'debug'):
             
             # Expose to shell
             self._applets = []
-            self._applets.append(self.projectMetadataApplet)
             self._applets.append(self.dataSelectionApplet)
             self._applets.append(self.featureSelectionApplet)
             self._applets.append(self.pixelClassificationApplet)
@@ -107,16 +104,16 @@ if ilastik.config.cfg.getboolean('ilastik', 'debug'):
             opPixelClassification.InputImages.connect( op5.Output )
             opPixelClassification.FeatureImages.connect( opFeatureSelection.OutputImage )
             opPixelClassification.CachedFeatureImages.connect( opFeatureSelection.CachedOutputImage )
-            opPixelClassification.LabelsAllowedFlags.connect( opData.AllowLabels )
             
             # We assume the membrane boundaries are found in the first prediction class (channel 0)
             opSingleChannelSelector = OpSingleChannelSelector(parent=self)
             opSingleChannelSelector.Input.connect( opPixelClassification.PredictionProbabilities )
             opSingleChannelSelector.Index.setValue(0)
             
+            opPreprocessing.OverlayData.connect( op5.Output )
             opPreprocessing.InputData.connect( opSingleChannelSelector.Output )
-            opPreprocessing.RawData.connect( op5.Output )
-            opCarvingLane.RawData.connect( op5.Output )
+
+            opCarvingLane.OverlayData.connect( op5.Output )
             opCarvingLane.InputData.connect( opSingleChannelSelector.Output )
             opCarvingLane.FilteredInputData.connect( opPreprocessing.FilteredImage )
     
@@ -124,7 +121,6 @@ if ilastik.config.cfg.getboolean('ilastik', 'debug'):
             opCarvingLane.WriteSeeds.connect( opCarvingLane.InputData )
     
             opCarvingLane.MST.connect(opPreprocessing.PreprocessedData)
-            #opCarvingLane.opLabeling.LabelsAllowedFlag.connect( opData.AllowLabels )
             opCarvingLane.UncertaintyType.setValue("none")
             
             self.preprocessingApplet.enableDownstream(False)

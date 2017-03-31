@@ -43,11 +43,16 @@ def _format_version(t):
     """converts a tuple to a string"""
     return '.'.join(str(i) for i in t)
 
-__version_info__ = (1, 1, '7a1')
+__version_info__ = (1, 2, '0') # Don't forget to update the splash screen!
 __version__ = _format_version(__version_info__)
 
-core_developers = [ "Stuart Berg", 
+core_developers = [ "Janez Ales",
+                    "Thorsten Beier",
+                    "Stuart Berg", 
+                    "Jaime Cervantes",
+                    "Markus Doering",
                     "Fred Hamprecht", 
+                    "Carsten Haubold",
                     "Bernhard Kausler", 
                     "Anna Kreshuk", 
                     "Ullrich Koethe", 
@@ -56,17 +61,20 @@ core_developers = [ "Stuart Berg",
                     "Christoph Sommer", 
                     "Christoph Straehle" ]
 
-developers = [ "Markus Doering", 
+developers = [ "Niels Buwen",
+               "Christoph Decker",
                "Kemal Eren", 
                "Burcin Erocal", 
                "Luca Fiaschi", 
-               "Carsten Haubold", 
-               "Ben Heuer", 
                "Philipp Hanslovsky", 
+               "Ben Heuer",
+               "Glendon Holst",
+               "Fabian Isensee", 
                "Kai Karius", 
                "Jens Kleesiek", 
                "Markus Nullmeier", 
                "Oliver Petra", 
+               "Steffen Wolf",
                "Buote Xu", 
                "Chong Zhang" ]
 
@@ -98,7 +106,7 @@ def isVersionCompatible(version):
     v2 = __version_info__[0:2]
     
     # Version 1.0 is compatible in all respects with version 0.6
-    compatible_set = [(0,6), (1,0), (1,1)]
+    compatible_set = [(0,6), (1,0), (1,1), (1,2)]
     if v1 in compatible_set and v2 in compatible_set:
         return True
     

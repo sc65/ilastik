@@ -84,51 +84,74 @@ class TrackingBaseGui( LayerViewerGui ):
     def setupLayers( self ):
         layers = []
 
+        # use same colortable for the following two generated layers: the merger
+        # and the tracking layer
+        self.tracking_colortable = colortables.create_random_16bit()
+        self.tracking_colortable[0] = QColor(0,0,0,0).rgba() # make 0 transparent
+        self.tracking_colortable[1] = QColor(128,128,128,255).rgba() # misdetections have id 1 and will be indicated by grey
+
+        self.merger_colortable = colortables.create_default_16bit()
+        for i in range(7):
+            self.merger_colortable[i] = self.mergerColors[i].rgba()
+
         if "MergerOutput" in self.topLevelOperatorView.outputs:
-            ct = colortables.create_default_8bit()
-            for i in range(7):
-                ct[i] = self.mergerColors[i].rgba()
+            parameters = self.mainOperator.Parameters.value
+
+            if 'withMergerResolution' in parameters.keys() and not parameters['withMergerResolution']:
+                merger_ct = self.merger_colortable
+            else:
+                merger_ct = self.tracking_colortable
+                
+            # Using same color table for tracking with and without mergers (Is there any reason for using different color tables?)
+            merger_ct = self.tracking_colortable
 
             if self.topLevelOperatorView.MergerCachedOutput.ready():
                 self.mergersrc = LazyflowSource( self.topLevelOperatorView.MergerCachedOutput )
             else:
-                self.mergersrc = LazyflowSource( self.topLevelOperatorView.ZeroOutput )
+                self.mergersrc = LazyflowSource( self.topLevelOperatorView.zeroProvider.Output )
 
-            mergerLayer = ColortableLayer( self.mergersrc, ct )
+            mergerLayer = ColortableLayer( self.mergersrc, merger_ct )
             mergerLayer.name = "Merger"
-            mergerLayer.visible = True
-            layers.append(mergerLayer)
 
-        ct = colortables.create_random_16bit()
-        ct[0] = QColor(0,0,0,0).rgba() # make 0 transparent
-        ct[1] = QColor(128,128,128,255).rgba() # misdetections have id 1 and will be indicated by grey
+            if 'withMergerResolution' in parameters.keys() and not parameters['withMergerResolution']:
+                mergerLayer.visible = True
+            else:
+                mergerLayer.visible = False
+
+            layers.append(mergerLayer)
 
         if self.topLevelOperatorView.CachedOutput.ready():
             self.trackingsrc = LazyflowSource( self.topLevelOperatorView.CachedOutput )
-            trackingLayer = ColortableLayer( self.trackingsrc, ct )
+            trackingLayer = ColortableLayer( self.trackingsrc, self.tracking_colortable )
             trackingLayer.name = "Tracking"
             trackingLayer.visible = True
             trackingLayer.opacity = 1.0
             layers.append(trackingLayer)
+
         elif self.topLevelOperatorView.zeroProvider.Output.ready():
             # provide zeros while waiting for the tracking result
             self.trackingsrc = LazyflowSource( self.topLevelOperatorView.zeroProvider.Output )
-            trackingLayer = ColortableLayer( self.trackingsrc, ct )
+            trackingLayer = ColortableLayer( self.trackingsrc, self.tracking_colortable )
             trackingLayer.name = "Tracking"
             trackingLayer.visible = True
             trackingLayer.opacity = 1.0
             layers.append(trackingLayer)
 
-        if self.topLevelOperatorView.LabelImage.ready():
-            self.objectssrc = LazyflowSource( self.topLevelOperatorView.LabelImage )
-            ct = colortables.create_random_16bit()
-            ct[0] = QColor(0,0,0,0).rgba() # make 0 transparent
-            objLayer = ColortableLayer( self.objectssrc, ct )
-            objLayer.name = "Objects"
-            objLayer.opacity = 1.0
-            objLayer.visible = True
-            layers.append(objLayer)
-
+        if "RelabeledImage" in self.topLevelOperatorView.outputs:
+            if self.topLevelOperatorView.RelabeledCachedOutput.ready():
+                self.objectssrc = LazyflowSource( self.topLevelOperatorView.RelabeledCachedOutput )
+            else:
+                self.objectssrc = LazyflowSource( self.topLevelOperatorView.zeroProvider.Output )
+        else:
+            if self.topLevelOperatorView.LabelImage.ready():
+                self.objectssrc = LazyflowSource( self.topLevelOperatorView.LabelImage )
+        ct = colortables.create_random_16bit()
+        ct[0] = QColor(0,0,0,0).rgba() # make 0 transparent
+        objLayer = ColortableLayer( self.objectssrc, ct )
+        objLayer.name = "Objects"
+        objLayer.opacity = 1.0
+        objLayer.visible = False
+        layers.append(objLayer)
 
         if self.mainOperator.RawImage.ready():
             rawLayer = self.createStandardLayerFromSlot(self.mainOperator.RawImage)
@@ -223,6 +246,9 @@ class TrackingBaseGui( LayerViewerGui ):
         to_z.setRange(from_z.value(),maxz)
 
 
+    # TODO Remove the following code together with the labels in the GUI as it
+    # is no longer needed. The merger colors are now determined by the track id
+    # and therefore by the colormap of the tracking layer.
     def _initColors(self):
         self.mergerColors = [ QColor(c) for c in LabelingGui._createDefault16ColorColorTable()[1:] ]
         self.mergerColors[0] = QColor(0,0,0,0) # 0 and 1 must be transparent
@@ -280,38 +306,22 @@ class TrackingBaseGui( LayerViewerGui ):
             self.applet.busy = True
             self.applet.appletStateUpdateRequested.emit()
 
-            t_from = None
-            # determine from_time (it could has been changed in the GUI meanwhile)            
-            for t_from, label2color_at in enumerate(self.mainOperator.label2color):
-                if len(label2color_at) == 0:
-                    continue
-                else:
-                    break
-
-            if t_from is None:
-                self._criticalMessage("There is nothing to export.")
-                return
-
-            t_from = int(t_from)
+            if hasattr(self.mainOperator,"RelabeledImage"):
+                labelImageSlot = self.mainOperator.RelabeledImage
+            else:
+                labelImageSlot = self.mainOperator.LabelImage
 
             logger.info( "Saving first label image..." )
             key = []
-            for idx, flag in enumerate(axisTagsToString(self.mainOperator.LabelImage.meta.axistags)):
+            for idx, flag in enumerate(axisTagsToString(labelImageSlot.meta.axistags)):
                 if flag is 't':
-                    key.append(slice(t_from,t_from+1))
+                    key.append(slice(0,labelImageSlot.meta.shape[idx]))#slice(t_from,t_from+1))
                 elif flag is 'c':
                     key.append(slice(0,1))
                 else:
-                    key.append(slice(0,self.mainOperator.LabelImage.meta.shape[idx]))
-
-
-            roi = SubRegion(self.mainOperator.LabelImage, key)
-            labelImage = self.mainOperator.LabelImage.get(roi).wait()
-            labelImage = labelImage[0,...,0]
+                    key.append(slice(0,labelImageSlot.meta.shape[idx]))
 
             try:
-                # write_events([], str(directory), t_from, labelImage)
-
                 events = self.mainOperator.EventsVector.value
                 logger.info( "Saving events..." )
                 logger.info( "Length of events " + str(len(events)) )
@@ -321,15 +331,12 @@ class TrackingBaseGui( LayerViewerGui ):
                 for i in sorted(events.keys()):
                     events_at = events[i]
                     i = int(i)
-                    t = t_from + i
+                    t = i
                     key[0] = slice(t,t+1)
-                    roi = SubRegion(self.mainOperator.LabelImage, key)
-                    labelImage = self.mainOperator.LabelImage.get(roi).wait()
+                    roi = SubRegion(labelImageSlot, key)
+                    labelImage = labelImageSlot.get(roi).wait()
                     labelImage = labelImage[0,...,0]
-                    if self.withMergers:
-                        write_events(events_at, str(directory), t, labelImage, self.mainOperator.mergers)
-                    else:
-                        write_events(events_at, str(directory), t, labelImage)
+                    write_events(events_at, str(directory), t, labelImage)
                     _handle_progress(i/num_files * 100)
             except IOError as e:
                 self._criticalMessage("Cannot export the tracking results. Maybe these files already exist. "\

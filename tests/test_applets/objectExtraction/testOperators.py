@@ -112,6 +112,31 @@ class TestOpRegionFeatures(object):
         print "feature length:", len(feats)
         OpObjectExtraction.createExportTable(feats)
 
+class TestPlugins(object):
+    def setUp(self):
+        g = Graph()
+        self.op = OpObjectExtraction(graph=g)
+
+        # Raw image is arbitrary for our purposes. Just re-use the
+        # label image
+        rm = rawImage()
+        rm = rm[:, :, :, 0:1, :]
+        self.op.RawImage.setValue(rm)
+        self.Features_standard = FEATURES
+        self.Features_convex_hull = {'2D Convex Hull Features': {'HullVolume': {}, 'DefectVolumeKurtosis': {}}}
+        self.Features_skeleton = {'2D Skeleton Features': {'Diameter': {}, 'Total Length': {}}}
+        #self.op.Features.setValue(FEATURES)
+        bm = binaryImage()
+        bm = bm[:, :, :, 0:1, :] 
+        self.op.BinaryImage.setValue(bm)
+
+    def test_plugins(self):
+        self.op.Features.setValue(self.Features_standard)
+        feats = self.op.RegionFeatures([0]).wait()
+        self.op.Features.setValue(self.Features_convex_hull)
+        feats = self.op.RegionFeatures([0]).wait()
+        self.op.Features.setValue(self.Features_skeleton)
+        feats = self.op.RegionFeatures([0]).wait()
 
 class testOpRegionFeaturesAgainstNumpy(object):
     def setUp(self):
@@ -171,8 +196,8 @@ class testOpRegionFeaturesAgainstNumpy(object):
                 assert npmean == means[iobj]
                 #currently, we have a margin of 30, this assert is very dependent on it
                 #FIXME: make margin visible from outside and use it here
-                zmin = max(mins[iobj][2]-1, 0)
-                zmax = min(maxs[iobj][2]+1, self.rawimage.shape[3])
+                zmin = int(max(mins[iobj][2]-1, 0))
+                zmax = int(min(maxs[iobj][2]+1, self.rawimage.shape[3]))
 
                 exclmask = labelimage[t,:, :, zmin:zmax, :]!=iobj
                 npsum_excl = np.sum(np.asarray(self.rawimage)[t,:, :, zmin:zmax,:][exclmask])

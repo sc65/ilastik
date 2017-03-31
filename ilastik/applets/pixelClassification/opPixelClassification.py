@@ -24,14 +24,17 @@ from functools import partial
 
 #SciPy
 import numpy
+#import IPython
 import vigra
 
 #lazyflow
 from lazyflow.roi import determineBlockShape
-from lazyflow.graph import Operator, InputSlot, OutputSlot
+from lazyflow.graph import Operator, InputSlot, OutputSlot, OperatorWrapper
 from lazyflow.operators import OpValueCache, OpTrainClassifierBlocked, OpClassifierPredict,\
                                OpSlicedBlockedArrayCache, OpMultiArraySlicer2, \
-                               OpPixelOperator, OpMaxChannelIndicatorOperator, OpCompressedUserLabelArray
+                               OpPixelOperator, OpMaxChannelIndicatorOperator, OpCompressedUserLabelArray, OpFeatureMatrixCache
+import ilastik_feature_selection
+import numpy as np
 
 from lazyflow.classifiers import ParallelVigraRfLazyflowClassifierFactory
 
@@ -39,6 +42,8 @@ from lazyflow.classifiers import ParallelVigraRfLazyflowClassifierFactory
 from ilastik.applets.base.applet import DatasetConstraintError
 from ilastik.utility.operatorSubView import OperatorSubView
 from ilastik.utility import OpMultiLaneWrapper
+
+#from PyQt4.QtCore import pyqtRemoveInputHook, pyqtRestoreInputHook
 
 class OpPixelClassification( Operator ):
     """
@@ -53,7 +58,6 @@ class OpPixelClassification( Operator ):
     PredictionMasks = InputSlot(level=1, optional=True) # Routed to OpClassifierPredict.PredictionMask.  See there for details.
 
     LabelInputs = InputSlot(optional = True, level=1) # Input for providing label data from an external source
-    LabelsAllowedFlags = InputSlot(stype='bool', level=1) # Specifies which images are permitted to be labeled 
     
     FeatureImages = InputSlot(level=1) # Computed feature images (each channel is a different feature)
     CachedFeatureImages = InputSlot(level=1) # Cached feature data.
@@ -64,6 +68,7 @@ class OpPixelClassification( Operator ):
     PredictionsFromDisk = InputSlot(optional=True, level=1)
 
     PredictionProbabilities = OutputSlot(level=1) # Classification predictions (via feature cache for interactive speed)
+    PredictionProbabilitiesUint8 = OutputSlot(level=1) # Same thing, but converted to uint8 first
 
     PredictionProbabilityChannels = OutputSlot(level=2) # Classification predictions, enumerated by channel
     SegmentationChannels = OutputSlot(level=2) # Binary image of the final selections.
@@ -86,9 +91,10 @@ class OpPixelClassification( Operator ):
     LabelNames = OutputSlot()
     LabelColors = OutputSlot()
     PmapColors = OutputSlot()
+    Bookmarks = OutputSlot(level=1)
 
     NumClasses = OutputSlot()
-    
+
     def setupOutputs(self):
         self.LabelNames.meta.dtype = object
         self.LabelNames.meta.shape = (1,)
@@ -125,7 +131,7 @@ class OpPixelClassification( Operator ):
         self.opTrain = OpTrainClassifierBlocked( parent=self )
         self.opTrain.ClassifierFactory.connect( self.ClassifierFactory )
         self.opTrain.Labels.connect( self.opLabelPipeline.Output )
-        self.opTrain.Images.connect( self.CachedFeatureImages )
+        self.opTrain.Images.connect( self.FeatureImages )
         self.opTrain.nonzeroLabelBlocks.connect( self.opLabelPipeline.nonzeroBlocks )
 
         # Hook up the Classifier Cache
@@ -145,6 +151,13 @@ class OpPixelClassification( Operator ):
         self.opPredictionPipeline.FreezePredictions.connect( self.FreezePredictions )
         self.opPredictionPipeline.PredictionsFromDisk.connect( self.PredictionsFromDisk )
         self.opPredictionPipeline.PredictionMask.connect( self.PredictionMasks )
+
+        # Feature Selection Stuff
+        self.opFeatureMatrixCaches = OpMultiLaneWrapper(OpFeatureMatrixCache, parent=self)
+        self.opFeatureMatrixCaches.LabelImage.connect(self.opLabelPipeline.Output)
+        self.opFeatureMatrixCaches.FeatureImage.connect(self.FeatureImages)
+        self.opFeatureMatrixCaches.LabelImage.setDirty()  # do I still need this?
+
         
         def _updateNumClasses(*args):
             """
@@ -160,6 +173,7 @@ class OpPixelClassification( Operator ):
 
         # Prediction pipeline outputs -> Top-level outputs
         self.PredictionProbabilities.connect( self.opPredictionPipeline.PredictionProbabilities )
+        self.PredictionProbabilitiesUint8.connect( self.opPredictionPipeline.PredictionProbabilitiesUint8 )
         self.CachedPredictionProbabilities.connect( self.opPredictionPipeline.CachedPredictionProbabilities )
         self.HeadlessPredictionProbabilities.connect( self.opPredictionPipeline.HeadlessPredictionProbabilities )
         self.HeadlessUint8PredictionProbabilities.connect( self.opPredictionPipeline.HeadlessUint8PredictionProbabilities )
@@ -171,6 +185,7 @@ class OpPixelClassification( Operator ):
 
         def inputResizeHandler( slot, oldsize, newsize ):
             if ( newsize == 0 ):
+                self.Bookmarks.resize(0)
                 self.LabelImages.resize(0)
                 self.NonzeroLabelBlocks.resize(0)
                 self.PredictionProbabilities.resize(0)
@@ -263,6 +278,11 @@ class OpPixelClassification( Operator ):
                 validShape = slot.meta.getTaggedShape()
                 break
 
+        if 't' in thisLaneTaggedShape:
+            del thisLaneTaggedShape['t']
+        if 't' in validShape:
+            del validShape['t']
+
         if validShape['c'] != thisLaneTaggedShape['c']:
             raise DatasetConstraintError(
                  "Pixel Classification",
@@ -278,7 +298,7 @@ class OpPixelClassification( Operator ):
                  .format( len(thisLaneTaggedShape), len(validShape) ) )
         
         mask_slot = self.PredictionMasks[laneIndex]
-        input_shape = tuple(thisLaneTaggedShape.values())
+        input_shape = self.InputImages[laneIndex].meta.shape
         if mask_slot.ready() and mask_slot.meta.shape[:-1] != input_shape[:-1]:
             raise DatasetConstraintError(
                  "Pixel Classification",
@@ -300,9 +320,12 @@ class OpPixelClassification( Operator ):
         numLanes = len(self.InputImages)
         assert numLanes == laneIndex, "Image lanes must be appended."        
         self.InputImages.resize(numLanes+1)
+        self.Bookmarks.resize(numLanes+1)
+        self.Bookmarks[numLanes].setValue([]) # Default value
         
     def removeLane(self, laneIndex, finalLength):
         self.InputImages.removeSlot(laneIndex, finalLength)
+        self.Bookmarks.removeSlot(laneIndex, finalLength)
 
     def getLane(self, laneIndex):
         return OperatorSubView(self, laneIndex)
@@ -340,6 +363,10 @@ class OpPixelClassification( Operator ):
         for laneIndex in range(len(self.InputImages)):
             self.getLane( laneIndex ).opLabelPipeline.opLabelArray.mergeLabels(from_label, into_label)
 
+    def clearLabel(self, label_value):
+        for laneIndex in range(len(self.InputImages)):
+            self.getLane( laneIndex ).opLabelPipeline.opLabelArray.clearLabel(label_value)
+
 class OpLabelPipeline( Operator ):
     RawImage = InputSlot()
     LabelInput = InputSlot()
@@ -369,8 +396,8 @@ class OpLabelPipeline( Operator ):
         if 't' in tagged_shape:
             tagged_shape['t'] = 1
         
-        # Aim for blocks that are roughly 1MB
-        block_shape = determineBlockShape( tagged_shape.values(), 1e6 )
+        # Aim for blocks that are roughly 20px
+        block_shape = determineBlockShape( tagged_shape.values(), 40**3 )
         self.opLabelArray.blockShape.setValue( block_shape )
 
     def setInSlot(self, slot, subindex, roi, value):
@@ -481,6 +508,9 @@ class OpPredictionPipeline(OpPredictionPipelineNoCache):
 
     PredictionProbabilities = OutputSlot()
     CachedPredictionProbabilities = OutputSlot()
+
+    PredictionProbabilitiesUint8 = OutputSlot()
+    
     PredictionProbabilityChannels = OutputSlot( level=1 )
     SegmentationChannels = OutputSlot( level=1 )
     UncertaintyEstimate = OutputSlot()
@@ -496,6 +526,13 @@ class OpPredictionPipeline(OpPredictionPipelineNoCache):
         self.predict.PredictionMask.connect(self.PredictionMask)
         self.predict.LabelsCount.connect( self.NumClasses )
         self.PredictionProbabilities.connect( self.predict.PMaps )
+
+        # Alternate headless output: uint8 instead of float.
+        # Note that drange is automatically updated.        
+        self.opConvertToUint8 = OpPixelOperator( parent=self )
+        self.opConvertToUint8.Input.connect( self.predict.PMaps )
+        self.opConvertToUint8.Function.setValue( lambda a: (255*a).astype(numpy.uint8) )
+        self.PredictionProbabilitiesUint8.connect( self.opConvertToUint8.Output )
 
         # Prediction cache for the GUI
         self.prediction_cache_gui = OpSlicedBlockedArrayCache( parent=self )
@@ -553,30 +590,14 @@ class OpPredictionPipeline(OpPredictionPipelineNoCache):
                        'x' : (256,256),
                        'c' : (100,100) }
 
-        blockDimsTBlock = { 't' : (20,20),
-                            'z' : (1,1),
-                            'y' : (256,256),
-                            'x' : (256,256),
-                            'c' : (100,100) }
+        blockShapeX = tuple( blockDimsX[k][1] for k in axisOrder )
+        blockShapeY = tuple( blockDimsY[k][1] for k in axisOrder )
+        blockShapeZ = tuple( blockDimsZ[k][1] for k in axisOrder )
 
-        innerBlockShapeX = tuple( blockDimsX[k][0] for k in axisOrder )
-        outerBlockShapeX = tuple( blockDimsX[k][1] for k in axisOrder )
+        self.prediction_cache_gui.BlockShape.setValue( (blockShapeX, blockShapeY, blockShapeZ) )
+        self.opUncertaintyCache.BlockShape.setValue( (blockShapeX, blockShapeY, blockShapeZ) )
 
-        innerBlockShapeY = tuple( blockDimsY[k][0] for k in axisOrder )
-        outerBlockShapeY = tuple( blockDimsY[k][1] for k in axisOrder )
-
-        innerBlockShapeZ = tuple( blockDimsZ[k][0] for k in axisOrder )
-        outerBlockShapeZ = tuple( blockDimsZ[k][1] for k in axisOrder )
-
-        innerBlockShapeT = tuple( blockDimsTBlock[k][0] for k in axisOrder )
-        outerBlockShapeT = tuple( blockDimsTBlock[k][1] for k in axisOrder )
-
-        self.prediction_cache_gui.inputs["innerBlockShape"].setValue( (innerBlockShapeX, innerBlockShapeY, innerBlockShapeZ, innerBlockShapeT) )
-        self.prediction_cache_gui.inputs["outerBlockShape"].setValue( (outerBlockShapeX, outerBlockShapeY, outerBlockShapeZ, innerBlockShapeT) )
-
-        self.opUncertaintyCache.inputs["innerBlockShape"].setValue( (innerBlockShapeX, innerBlockShapeY, innerBlockShapeZ, innerBlockShapeT) )
-        self.opUncertaintyCache.inputs["outerBlockShape"].setValue( (outerBlockShapeX, outerBlockShapeY, outerBlockShapeZ, innerBlockShapeT) )
-
+        assert self.opConvertToUint8.Output.meta.drange == (0,255)
 
 class OpEnsembleMargin(Operator):
     """
@@ -628,3 +649,145 @@ class OpEnsembleMargin(Operator):
         roi.start[chanAxis] = 0
         roi.stop[chanAxis] = 1
         self.Output.setDirty( roi )
+
+class OpFilterFeatureSelection(Operator):
+    FeatureLabelMatrix = InputSlot(level=1)
+    FilterMethod = InputSlot(optional=True)
+    NumberOfSelectedFeatures = InputSlot()
+
+    SelectedFeatureIDs = OutputSlot()
+
+    def setupOutputs(self):
+        # the output slot should maybe contain the internal feature IDs or a bool list of len(internal_feature_ids)
+        self.SelectedFeatureIDs.meta.shape = (1,)
+        self.SelectedFeatureIDs.meta.dtype = list
+        self._filter_method = "ICAP"
+        feature_label_matrix = self.FeatureLabelMatrix[0].value
+        labels = feature_label_matrix[:, 0]  # first row is labels
+        data = feature_label_matrix[:, 1:]  # the rest is data
+        self.feature_selector = ilastik_feature_selection.filter_feature_selection.FilterFeatureSelection(data, labels.astype("int"), self._filter_method)
+
+        if self.FilterMethod.connected():
+            self._filter_method = self.FilterMethod.value
+
+    def execute(self, slot, subindex, roi, result):
+
+        selected_features = self.feature_selector.run(self.NumberOfSelectedFeatures.value)
+
+        # selected_features_names = [self.FeatureImages[0].meta['channel_names'][i] for i in selected_features]
+        # how do I convert feature names to internal feature IDs?
+
+        result = [selected_features]
+        return result
+
+    def propagateDirty(self, slot, subindex, roi):
+        self.SelectedFeatureIDs.setDirty()
+
+class OpWrapperFeatureSelection(Operator):
+    FeatureLabelMatrix = InputSlot(level=1)
+    WrapperMethod = InputSlot(optional=True)  # "SFS", "BFS", or "SBE"
+    Classifier = InputSlot(optional=True)  # not used. In the future it should be possible to plug in a classifier here.
+    # Default classifier it sklearn random forest
+    EvaluationFunction = InputSlot(optional=True)  # if this is not connected then we use a default
+    ComplexityPenalty = InputSlot(optional=True)
+
+    SelectedFeatureIDs = OutputSlot()
+
+    def setupOutputs(self):
+        if self.WrapperMethod.connected():
+            self._wrapper_method = self.WrapperMethod.value
+        else:
+            self._wrapper_method = "SFS"
+
+        if self.Classifier.connected():
+            self._classifier = self.Classifier.value
+        else:
+            from sklearn import ensemble
+            self._classifier = ensemble.RandomForestClassifier(n_estimators=100, n_jobs=-1)
+
+        if self.EvaluationFunction.connected():
+            self._evaluation_fct = self.EvaluationFunction.value
+        else:
+            if self.ComplexityPenalty.connected():
+                complexity_penalty = self.ComplexityPenalty.value
+            else:
+                complexity_penalty = 0.07 # default
+            self._evaluator = ilastik_feature_selection.wrapper_feature_selection.EvaluationFunction(self._classifier, complexity_penalty = complexity_penalty)
+            self._evaluation_fct = self._evaluator.evaluate_feature_set_size_penalty
+
+        # the output slot should maybe contain the internal feature IDs or a bool list of len(internal_feature_ids)
+        self.SelectedFeatureIDs.meta.shape = (1,)
+        self.SelectedFeatureIDs.meta.dtype = list
+
+    def execute(self, slot, subindex, roi, result):
+
+        feature_label_matrix = self.FeatureLabelMatrix[0].value
+
+        labels = feature_label_matrix[:, 0]  # first row is labels
+        data = feature_label_matrix[:, 1:]  # the rest is data
+
+
+        feature_selector = ilastik_feature_selection.wrapper_feature_selection.WrapperFeatureSelection(data,
+                                                                                               labels.astype("int"),
+                                                                                               self._evaluation_fct, self._wrapper_method)
+
+
+        selected_features = feature_selector.run(overshoot=3)[0]
+
+        # selected_features_names = [self.FeatureImages[0].meta['channel_names'][i] for i in selected_features]
+
+        result = [selected_features]
+        return result
+
+    def propagateDirty(self, slot, subindex, roi):
+        self.SelectedFeatureIDs.setDirty()
+
+class OpGiniFeatureSelection(Operator):
+    FeatureLabelMatrix = InputSlot(level=1)
+    NumberOfSelectedFeatures = InputSlot()
+
+    SelectedFeatureIDs = OutputSlot()
+
+    def setupOutputs(self):
+        # the output slot should maybe contain the internal feature IDs or a bool list of len(internal_feature_ids)
+        self.SelectedFeatureIDs.meta.shape = (1,)
+        self.SelectedFeatureIDs.meta.dtype = list
+
+    def execute(self, slot, subindex, roi, result):
+
+        feature_label_matrix = self.FeatureLabelMatrix[0].value
+
+        labels = feature_label_matrix[:, 0]  # first row is labels
+        data = feature_label_matrix[:, 1:]  # the rest is data
+
+        from sklearn import ensemble
+        rf = ensemble.RandomForestClassifier(n_estimators = 100, n_jobs = -1)
+        rf.fit(data, labels)
+        importances = rf.feature_importances_
+
+        result = [np.argsort(importances)[-self.NumberOfSelectedFeatures.value:].astype("int")]
+
+        # this was an attempt to use Jaime's recursive feature elimination using gini importance. It provided worse
+        # results than simply choosing the k best features according to their importance, maybe I have a bug??
+        ''' removed_features = np.array([])
+        remaining_features = np.arange(data.shape[1])
+
+        pyqtRemoveInputHook()
+        import IPython
+        IPython.embed()
+        pyqtRestoreInputHook()
+
+        for i in range(data.shape[1]):
+            sorted_importances = np.argsort(importances)
+            removed_features = np.append(removed_features, [remaining_features[sorted_importances[0]]])
+            remaining_features = remaining_features[remaining_features != sorted_importances[0]]
+
+            rf.fit(data[:, remaining_features], labels)
+            importances = rf.feature_importances_
+
+        result = [removed_features[- self.NumberOfSelectedFeatures.value:].astype("int")]
+        '''
+        return result
+
+    def propagateDirty(self, slot, subindex, roi):
+        self.SelectedFeatureIDs.setDirty()

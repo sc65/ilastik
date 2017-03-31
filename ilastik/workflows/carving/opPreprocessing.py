@@ -50,6 +50,8 @@ class OpFilter(Operator):
     Filter = InputSlot(value=HESSIAN_BRIGHT)
     Sigma = InputSlot(value=1.6)
     
+    Overlay = InputSlot(optional=True) # GUI-only.  Shown over raw data if available.
+    
     Output = OutputSlot()
 
     def setupOutputs(self):
@@ -179,12 +181,12 @@ class OpSimpleWatershed(Operator):
             if self.Input.meta.getTaggedShape()['z'] > 1:
                 sys.stdout.write("Watershed..."); sys.stdout.flush()
                 #result_view[...] = vigra.analysis.watersheds(volume_feat[:,:])[0].astype(numpy.int32)
-                result_view[...] = vigra.analysis.watersheds(volume_feat[:,:].astype(numpy.uint8))[0]
+                result_view[...] = vigra.analysis.watershedsNew(volume_feat[:,:].astype(numpy.uint8))[0]
                 logger.info( "done {}".format(numpy.max(result[...]) ) )
             else:
                 sys.stdout.write("Watershed..."); sys.stdout.flush()
                 
-                labelVolume = vigra.analysis.watersheds(volume_feat[:,:,0])[0]#.view(dtype=numpy.int32)
+                labelVolume = vigra.analysis.watershedsNew(volume_feat[:,:,0])[0]#.view(dtype=numpy.int32)
                 result_view[...] = labelVolume[:,:,numpy.newaxis]
                 logger.info( "done {}".format(numpy.max(labelVolume)) )
 
@@ -210,35 +212,38 @@ class OpMstSegmentorProvider(Operator):
 
     def execute(self,slot,subindex,roi,result):
         assert slot == self.MST, "Invalid output slot: {}".format(slot.name)
-        #first thing, show the user that we are waiting for computations to finish        
-        self.applet.progressSignal.emit(0)
-        
-        volume_feat = self.Image( *roiFromShape( self.Image.meta.shape ) ).wait()
-        labelVolume = self.LabelImage( *roiFromShape( self.LabelImage.meta.shape ) ).wait()
 
-        self.applet.progress = 0
-        def updateProgressBar(x):
-            #send signal iff progress is significant
-            if x-self.applet.progress>1 or x==100:
-                self.applet.progressSignal.emit(x)
-                self.applet.progress = x
-        
-       #mst= MSTSegmentor(labelVolume[0,...,0], 
-       #                  numpy.asarray(volume_feat[0,...,0], numpy.float32), 
-       #                  edgeWeightFunctor = "minimum",
-       #                  progressCallback = updateProgressBar)
-       ##mst.raw is not set here in order to avoid redundant data storage 
-       #mst.raw = None
-        
+        #first thing, show the user that we are waiting for computations to finish
+        self.applet.progressSignal.emit(-1)
+        try:
+            volume_feat = self.Image( *roiFromShape( self.Image.meta.shape ) ).wait()
+            labelVolume = self.LabelImage( *roiFromShape( self.LabelImage.meta.shape ) ).wait()
 
-        newMst = WatershedSegmentor(labelVolume[0,...,0],numpy.asarray(volume_feat[0,...,0], numpy.float32), 
-                          edgeWeightFunctor = "minimum",progressCallback = updateProgressBar)
+            self.applet.progress = 0
+            def updateProgressBar(x):
+                #send signal iff progress is significant
+                if x-self.applet.progress>1 or x==100:
+                    self.applet.progressSignal.emit(x)
+                    self.applet.progress = x
 
-        #Output is of shape 1
-        #result[0] = mst
-        newMst.raw = None
-        result[0] = newMst
-        return result        
+           #mst= MSTSegmentor(labelVolume[0,...,0],
+           #                  numpy.asarray(volume_feat[0,...,0], numpy.float32),
+           #                  edgeWeightFunctor = "minimum",
+           #                  progressCallback = updateProgressBar)
+           ##mst.raw is not set here in order to avoid redundant data storage
+           #mst.raw = None
+
+            newMst = WatershedSegmentor(labelVolume[0,...,0],numpy.asarray(volume_feat[0,...,0], numpy.float32),
+                              edgeWeightFunctor = "minimum",progressCallback = updateProgressBar)
+
+            #Output is of shape 1
+            #result[0] = mst
+            newMst.raw = None
+            result[0] = newMst
+            return result
+
+        finally:
+            self.applet.progressSignal.emit(100)
 
     def propagateDirty(self, slot, subindex, roi):
         self.MST.setDirty(slice(None))
@@ -250,7 +255,7 @@ class OpPreprocessing(Operator):
     name = "Preprocessing"
     
     #Image before preprocess
-    RawData = InputSlot(optional=True)
+    OverlayData = InputSlot(optional=True)
     InputData = InputSlot()
     Sigma = InputSlot(value = 1.6)
     Filter = InputSlot(value = 0)
@@ -265,7 +270,7 @@ class OpPreprocessing(Operator):
     WatershedImage = OutputSlot()
     WatershedSourceImage = OutputSlot()
 
-    # RawData -------- opRawFilter* ---------> opRawNormalize ----------                                                                  --> WatershedImage
+    # OverlayData ---- opOverlayFilter* -----> opOverlayNormalize ------                                                                  --> WatershedImage
     #                                                                   \                                                                /
     # InputData --> -- opInputFilter*--------> opInputNormalize -------> (SELECT by WatershedSource) --> opWatershed --> opWatershedCache --> opMstProvider --> [via execute()] --> PreprocessedData
     #              \                                                    /                                                                    /
@@ -301,12 +306,12 @@ class OpPreprocessing(Operator):
         
         self._opWatershedCache = OpArrayCache( parent=self )
         
-        self._opRawFilter = OpFilter( parent=self )
-        self._opRawFilter.Input.connect( self.RawData )
-        self._opRawFilter.Sigma.connect( self.Sigma )
+        self._opOverlayFilter = OpFilter( parent=self )
+        self._opOverlayFilter.Input.connect( self.OverlayData )
+        self._opOverlayFilter.Sigma.connect( self.Sigma )
         
-        self._opRawNormalize = OpNormalize255( parent=self )
-        self._opRawNormalize.Input.connect( self._opRawFilter.Output )
+        self._opOverlayNormalize = OpNormalize255( parent=self )
+        self._opOverlayNormalize.Input.connect( self._opOverlayFilter.Output )
         
         self._opInputFilter = OpFilter( parent=self )
         self._opInputFilter.Input.connect( self.InputData )
@@ -364,16 +369,16 @@ class OpPreprocessing(Operator):
 
         # If the user's boundaries are dark, then invert the special watershed sources
         if self.InvertWatershedSource.value:
-            self._opRawFilter.Filter.setValue( OpFilter.RAW_INVERTED )
+            self._opOverlayFilter.Filter.setValue( OpFilter.RAW_INVERTED )
             self._opInputFilter.Filter.setValue( OpFilter.RAW_INVERTED )
         else:
-            self._opRawFilter.Filter.setValue( OpFilter.RAW )
+            self._opOverlayFilter.Filter.setValue( OpFilter.RAW )
             self._opInputFilter.Filter.setValue( OpFilter.RAW )
 
         ws_source = self.WatershedSource.value
         if ws_source == 'raw':
-            if self.RawData.ready():
-                self._opWatershed.Input.connect( self._opRawNormalize.Output )
+            if self.OverlayData.ready():
+                self._opWatershed.Input.connect( self._opOverlayNormalize.Output )
             else:
                 self._opWatershed.Input.connect( self._opInputNormalize.Output )
         elif ws_source == 'input':

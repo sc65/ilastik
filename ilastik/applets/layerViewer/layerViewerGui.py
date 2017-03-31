@@ -25,7 +25,11 @@ import logging
 logger = logging.getLogger(__name__)
 traceLogger = logging.getLogger('TRACE.' + __name__)
 
+# SciPy
+import numpy
+
 #PyQt
+from PyQt4.QtCore import Qt
 from PyQt4.QtGui import *
 from PyQt4 import uic
 
@@ -37,7 +41,7 @@ from lazyflow.operators import OpSingleChannelSelector, OpWrapSlot
 from lazyflow.operators.opReorderAxes import OpReorderAxes
 
 #volumina
-from volumina.api import LazyflowSource, GrayscaleLayer, RGBALayer, LayerStackModel
+from volumina.api import LazyflowSource, GrayscaleLayer, RGBALayer, ColortableLayer, AlphaModulatedLayer, LayerStackModel, generateRandomColors
 from volumina.volumeEditor import VolumeEditor
 from volumina.utility import ShortcutManager
 from volumina.interpreter import ClickReportingInterpreter
@@ -164,6 +168,7 @@ class LayerViewerGui(QWidget):
                 self._handleLayerInsertion(slot, i)
  
         self.layerstack = LayerStackModel()
+        self.saved_layer_visibilities = None
 
         self._initCentralUic()
         self._initEditor(crosshair=crosshair)
@@ -177,7 +182,7 @@ class LayerViewerGui(QWidget):
         
         # By default, we start out disabled until we have at least one layer.
         self.centralWidget().setEnabled(False)
-        
+
     def _after_init(self):
         self._initialized = True
         self.updateAllLayers()
@@ -256,7 +261,7 @@ class LayerViewerGui(QWidget):
         c_index = slot.meta.axistags.index('c')
         if c_index < len(slot.meta.axistags):
             numChannels = slot.meta.shape[c_index]
-            display_mode = slot.meta.axistags["c"].description
+            display_mode = slot.meta.display_mode
                 
         if display_mode == "" or display_mode == "default":
             ## Figure out whether the default should be rgba or grayscale
@@ -268,8 +273,14 @@ class LayerViewerGui(QWidget):
             # Automatically select Grayscale or RGBA based on number of channels
             if numChannels == 2 or numChannels == 3:
                 display_mode = "rgba"
+            elif slot.meta.dtype == numpy.uint64:
+                display_mode = "random-colortable"
             else:
                 display_mode = "grayscale"
+
+        # Override RGBA --> Grayscale if there's only 1 channel.
+        if display_mode == "rgba" and numChannels == 1:
+            display_mode = "grayscale"
                 
         if display_mode == "grayscale":
             assert not lastChannelIsAlpha, "Can't have an alpha channel if there is no color channel"
@@ -279,8 +290,14 @@ class LayerViewerGui(QWidget):
                 "Unhandled combination of channels.  numChannels={}, lastChannelIsAlpha={}, axistags={}"\
                 .format( numChannels, lastChannelIsAlpha, slot.meta.axistags )
             return cls._create_rgba_layer_from_slot(slot, numChannels, lastChannelIsAlpha)
+        elif display_mode == "random-colortable":
+            return cls._create_random_colortable_layer_from_slot(slot)
+        elif display_mode == "alpha-modulated":
+            return cls._create_alpha_modulated_layer_from_slot(slot)
+        elif display_mode == "binary-mask":
+            return cls._create_binary_mask_layer_from_slot(slot)
         else:
-            raise RuntimeError("unknown channel display mode")
+            raise RuntimeError("unknown channel display mode: " + display_mode )
 
     @classmethod
     def _create_grayscale_layer_from_slot(cls, slot, n_channels):
@@ -290,6 +307,32 @@ class LayerViewerGui(QWidget):
         layer.set_range(0, slot.meta.drange)
         normalize = cls._should_normalize_display(slot)
         layer.set_normalize( 0, normalize )
+        return layer
+
+    @classmethod
+    def _create_random_colortable_layer_from_slot(cls, slot, num_colors=256):
+        colortable = generateRandomColors(num_colors, clamp={'v': 1.0, 's' : 0.5}, zeroIsTransparent=True)
+        layer = ColortableLayer(LazyflowSource(slot), colortable)
+        layer.colortableIsRandom = True
+        return layer
+
+    @classmethod
+    def _create_alpha_modulated_layer_from_slot(cls, slot):
+        layer = AlphaModulatedLayer( LazyflowSource(slot),
+                                     tintColor=QColor( Qt.cyan ),
+                                     range=(0.0, 1.0),
+                                     normalize=(0.0, 1.0) )
+        return layer
+
+    @classmethod
+    def _create_binary_mask_layer_from_slot(cls, slot):
+        # 0: black, 1-255: transparent
+        # This works perfectly for uint8.  
+        # For uint32, etc., values of 256,512, etc. will be appear 'off'.
+        # But why would you use uint32 for a binary mask anyway? 
+        colortable = [QColor(0,0,0,255).rgba()]
+        colortable += 255*[QColor(0,0,0,0).rgba()]
+        layer = ColortableLayer(LazyflowSource(slot), colortable)
         return layer
         
     @classmethod
@@ -400,10 +443,16 @@ class LayerViewerGui(QWidget):
             self.editor.dataShape = newDataShape
                        
             # Find the xyz midpoint
-            midpos5d = [x/2 for x in newDataShape]
-            
+            midpos5d = [x//2 for x in newDataShape]
+
             # center viewer there
             self.setViewerPos(midpos5d)
+
+            if not (self.editor.cropModel._crop_extents[0][0]  == None or self.editor.cropModel.cropZero()):
+                cropMidPos = [(b+a)//2 for [a,b] in self.editor.cropModel._crop_extents]
+                for i in range(3):
+                    self.editor.navCtrl.changeSliceAbsolute(cropMidPos[i],i)
+
 
         # Old layers are deleted if
         # (1) They are not in the new set or
@@ -460,6 +509,30 @@ class LayerViewerGui(QWidget):
                     newDataShape = self.getVoluminaShapeForSlot(slot)
         return newDataShape
 
+    def getLayerByName(self, name):
+        matches = filter(lambda l: l.name == name, list(self.layerstack))
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        assert False, "Found more than one matching layer with name {}".format( name )
+
+    def toggle_show_raw(self, raw_layer_name="Raw Data"):
+        """
+        Convenience function.
+        Hide all layers except for the raw data layer specified by the given layer name.
+        The next time this function is called, restore previous layer visibility states.
+        """
+        if self.saved_layer_visibilities:
+            for layer in self.layerstack:
+                layer.visible = self.saved_layer_visibilities[layer.name]
+            self.saved_layer_visibilities = None
+        else:
+            self.saved_layer_visibilities = {layer.name : layer.visible for layer in self.layerstack}
+            for layer in self.layerstack:
+                layer.visible = False
+            self.getLayerByName(raw_layer_name).visible = True
+
     @threadRouted
     def setViewerPos(self, pos, setTime=False, setChannel=False):
         try:
@@ -476,6 +549,13 @@ class LayerViewerGui(QWidget):
                 self.editor.posModel.channel = pos5d[4]
 
             self.editor.navCtrl.panSlicingViews( pos3d, [0,1,2] )
+            for i in range(3):
+                self.editor.navCtrl.changeSliceAbsolute(pos3d[i],i)
+            if not (self.editor.cropModel._crop_extents[0][0]  == None or self.editor.cropModel.cropZero()):
+                cropMidPos = [(b+a)//2 for [a,b] in self.editor.cropModel._crop_extents]
+                for i in range(3):
+                    self.editor.navCtrl.changeSliceAbsolute(cropMidPos[i],i)
+
         except Exception, e:
             logger.warn("Failed to navigate to position (%s): %s" % (pos, e))
         return
@@ -554,7 +634,8 @@ class LayerViewerGui(QWidget):
         self.editor.setNavigationInterpreter( self.clickReporter )
         self.clickReporter.rightClickReceived.connect( self._handleEditorRightClick )
         self.clickReporter.leftClickReceived.connect( self._handleEditorLeftClick )
-        
+        self.clickReporter.toolTipReceived.connect( self._handleEditorToolTip )
+
         clickReporter2 = ClickReportingInterpreter( self.editor.brushingInterpreter, self.editor.posModel )
         clickReporter2.rightClickReceived.connect( self._handleEditorRightClick )
         self.editor.brushingInterpreter = clickReporter2
@@ -617,5 +698,14 @@ class LayerViewerGui(QWidget):
         pass
 
     def handleEditorLeftClick(self, position5d, globalWindowCoordiante):
+        # Override me
+        pass
+
+    def _handleEditorToolTip(self, position5d, globalWindowCoordinate):
+        if len(self.layerstack) > 0:
+            dataPosition = self._convertPositionToDataSpace(position5d)
+            self.handleEditorToolTip(dataPosition, globalWindowCoordinate)
+
+    def handleEditorToolTip(self, position5d, globalWindowCoordinate):
         # Override me
         pass

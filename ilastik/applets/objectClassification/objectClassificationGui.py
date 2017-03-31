@@ -31,6 +31,9 @@ from ilastik.applets.objectExtraction.opObjectExtraction import default_features
 from ilastik.applets.objectClassification.opObjectClassification import OpObjectClassification
 
 import os
+import copy
+import vigra
+
 import numpy
 import weakref
 from functools import partial
@@ -38,6 +41,7 @@ from functools import partial
 from ilastik.config import cfg as ilastik_config
 from ilastik.utility import bind
 from ilastik.utility.gui import ThreadRouter, threadRouted
+from ilastik.plugins import pluginManager
 
 import logging
 logger = logging.getLogger(__name__)
@@ -117,7 +121,6 @@ class ObjectClassificationGui(LabelingGui):
         labelSlots.labelDelete = op.DeleteLabel
 
         labelSlots.maxLabelValue = op.NumLabels
-        labelSlots.labelsAllowed = op.LabelsAllowedFlags
         labelSlots.labelNames = op.LabelNames
         
         # We provide our own UI file (which adds an extra control for
@@ -279,17 +282,57 @@ class ObjectClassificationGui(LabelingGui):
     @pyqtSlot()
     def handleSubsetFeaturesClicked(self):
         mainOperator = self.topLevelOperatorView
-        computedFeatures = mainOperator.ComputedFeatureNames([]).wait()
+        computedFeatures = copy.deepcopy(mainOperator.ComputedFeatureNames([]).wait())
+        # do NOT show default features, the user did not want them for classification
+        # the key for the fake plugin of default features is taken from the top of opObjectExtraction file
         if mainOperator.SelectedFeatures.ready():
-            selectedFeatures = mainOperator.SelectedFeatures([]).wait()
+            selectedFeatures = copy.deepcopy(mainOperator.SelectedFeatures([]).wait())
         else:
-            selectedFeatures = None
+            selectedFeatures = computedFeatures
 
-        ndim = 3
-        at = mainOperator.RawImages.meta.axistags
-        z_shape = mainOperator.RawImages.meta.shape[at.index('z')]
-        if z_shape==1:
+        plugins = pluginManager.getPluginsOfCategory('ObjectFeatures')
+        taggedShape = mainOperator.RawImages.meta.getTaggedShape()
+        fakeimgshp = [taggedShape['x'], taggedShape['y']]
+        fakelabelsshp = [taggedShape['x'], taggedShape['y']]
+
+        if 'z' in taggedShape and taggedShape['z']>1:
+            fakeimgshp.append(taggedShape['z'])
+            fakelabelsshp.append(taggedShape['z'])
+            ndim = 3
+        else:
             ndim = 2
+        if 'c' in taggedShape and taggedShape['c']>1:
+            fakeimgshp.append(taggedShape['c'])
+
+        fakeimg = numpy.empty(fakeimgshp, dtype=numpy.float32)
+        fakelabels = numpy.empty(fakelabelsshp, dtype=numpy.uint32)
+
+        if ndim==3:
+            fakelabels = vigra.taggedView(fakelabels, 'xyz')
+            if len(fakeimgshp)==4:
+                fakeimg = vigra.taggedView(fakeimg, 'xyzc')
+            else:
+                fakeimg = vigra.taggedView(fakeimg, 'xyz')
+        if ndim==2:
+            fakelabels = vigra.taggedView(fakelabels, 'xy')
+            if len(fakeimgshp)==3:
+                fakeimg = vigra.taggedView(fakeimg, 'xyc')
+            else:
+                fakeimg = vigra.taggedView(fakeimg, 'xy')
+
+        for pluginInfo in plugins:
+            availableFeatures = pluginInfo.plugin_object.availableFeatures(fakeimg, fakelabels)
+            if len(availableFeatures) > 0:
+                if pluginInfo.name in self.applet._selectedFeatures.keys(): 
+                    assert pluginInfo.name in computedFeatures.keys(), 'Object Classification: {} not found in available (computed) object features'.format(pluginInfo.name)
+
+                if not pluginInfo.name in selectedFeatures and pluginInfo.name in self.applet._selectedFeatures:
+                        selectedFeatures[pluginInfo.name]=dict()
+
+                        for feature in self.applet._selectedFeatures[pluginInfo.name].keys():
+                            if feature in availableFeatures.keys():
+                                selectedFeatures[pluginInfo.name][feature] = availableFeatures[feature]
+
         dlg = FeatureSubSelectionDialog(computedFeatures,
                                         selectedFeatures=selectedFeatures, ndim=ndim)
         dlg.exec_()
@@ -302,6 +345,7 @@ class ObjectClassificationGui(LabelingGui):
             for plugin_features in dlg.selectedFeatures.itervalues():
                 nfeatures += len(plugin_features)
             self.labelingDrawerUi.featuresSubset.setText("{} features selected,\nsome may have multiple channels".format(nfeatures))
+        mainOperator.ComputedFeatureNames.setDirty(())
 
     @pyqtSlot()
     def checkEnableButtons(self):
@@ -450,7 +494,7 @@ class ObjectClassificationGui(LabelingGui):
                 value.pop(start)
                 # Force dirty propagation even though the list id is unchanged.
                 slot.setValue(value, check_changed=False)
-        
+
         
     def createLabelLayer(self, direct=False):
         """Return a colortable layer that displays the label slot

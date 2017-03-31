@@ -51,7 +51,7 @@ class ManualTrackingWorkflow( Workflow ):
         self.dataSelectionApplet = DataSelectionApplet(self, 
                                                        "Input Data", 
                                                        "Input Data", 
-                                                       forceAxisOrder='txyzc',
+                                                       forceAxisOrder=['txyzc'],
                                                        instructionText=data_instructions,
                                                        max_lanes=1
                                                        )
@@ -66,7 +66,10 @@ class ManualTrackingWorkflow( Workflow ):
                                                              workflow=self, interactive=False)
         
         self.trackingApplet = ManualTrackingApplet( workflow=self )
-        self.dataExportApplet = TrackingBaseDataExportApplet(self, "Tracking Result Export")
+        self.default_export_filename = '{dataset_dir}/{nickname}-exported_data.csv'
+        self.dataExportApplet = TrackingBaseDataExportApplet(self, 
+                                                             "Tracking Result Export", 
+                                                             default_export_filename=self.default_export_filename)
         
         opDataExport = self.dataExportApplet.topLevelOperator
         opDataExport.SelectionNames.setValue( ['Manual Tracking', 'Object Identities'] )
